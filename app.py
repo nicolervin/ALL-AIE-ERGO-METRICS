@@ -1,5 +1,6 @@
 import io
 import importlib
+import re
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -95,6 +96,13 @@ def find_column(frame: pd.DataFrame, candidates: list[str]) -> str | None:
     return None
 
 
+def coerce_numeric(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce")
+    cleaned = series.astype(str).str.replace(",", "", regex=False).str.extract(r"(-?\d+(?:\.\d+)?)")[0]
+    return pd.to_numeric(cleaned, errors="coerce")
+
+
 def build_production_df(frame: pd.DataFrame) -> pd.DataFrame:
     factory_col = find_column(frame, ["Site", "Factory"])
     year_col = find_column(frame, ["Year"])
@@ -184,42 +192,111 @@ def build_medical_requests_df(frame: pd.DataFrame) -> pd.DataFrame:
 def build_npi_metrics_df(frame: pd.DataFrame) -> pd.DataFrame:
     program_col = find_column(frame, ["NPI", "Program"])
     factory_col = find_column(frame, ["Site", "Factory"])
+    year_col = find_column(frame, ["Year"])
+    month_col = find_column(frame, ["Month"])
+    actual_eau_col = find_column(frame, ["Future_EAU_Volume", "EAU Actual", "EAU Current"])
+    target_eau_col = find_column(frame, ["Baseline_EAU-Volume", "EAU Target", "EAU Baseline"])
     actual_headcount_col = find_column(frame, ["Future_Headcount", "Headcount Actual"])
     target_headcount_col = find_column(frame, ["Baseline_Headcount", "Headcount Target"])
     actual_part_col = find_column(frame, ["Future_Part_Count", "Part Count Actual"])
     target_part_col = find_column(frame, ["Baseline_Part_Count", "Part Count Target"])
+    fishbone_col = find_column(frame, ["Fishbone_Status", "Fishbone Status"])
+    paag_col = find_column(frame, ["PAAG_Status", "At-a-Glance_Status", "At-a-Glance Status", "PAAG Status"])
+    pin_map_col = find_column(frame, ["Pin_Map_Status", "Pin Map Status"])
+    wins_col = find_column(frame, ["AIE_Wins_Opportunities", "AIE Wins Opportunities"])
     if not all([program_col, factory_col, actual_headcount_col, target_headcount_col]):
         raise ValueError("NPI metrics sheet is missing required columns.")
-    df = frame[[program_col, factory_col, actual_headcount_col, target_headcount_col, actual_part_col or target_headcount_col, target_part_col or target_headcount_col]].copy()
-    df.columns = ["Program", "Factory", "Headcount Actual", "Headcount Target", "Part Count Actual", "Part Count Target"]
+    source_columns = [
+        program_col,
+        factory_col,
+        year_col or program_col,
+        month_col or program_col,
+        actual_eau_col or actual_headcount_col,
+        target_eau_col or target_headcount_col,
+        actual_headcount_col,
+        target_headcount_col,
+        actual_part_col or target_headcount_col,
+        target_part_col or target_headcount_col,
+        fishbone_col or program_col,
+        paag_col or program_col,
+        pin_map_col or program_col,
+        wins_col or program_col,
+    ]
+    df = frame[source_columns].copy()
+    df.columns = [
+        "Program",
+        "Factory",
+        "Year",
+        "Month",
+        "EAU Actual",
+        "EAU Target",
+        "Headcount Actual",
+        "Headcount Target",
+        "Part Count Actual",
+        "Part Count Target",
+        "Fishbone Status",
+        "PAAG Status",
+        "Pin Map Status",
+        "AIE Wins Opportunities",
+    ]
     df["Program"] = df["Program"].astype(str)
     df["Factory"] = df["Factory"].astype(str)
-    df["Headcount Actual"] = pd.to_numeric(df["Headcount Actual"], errors="coerce").fillna(0)
-    df["Headcount Target"] = pd.to_numeric(df["Headcount Target"], errors="coerce").fillna(0)
-    df["Part Count Actual"] = pd.to_numeric(df["Part Count Actual"], errors="coerce").fillna(0)
-    df["Part Count Target"] = pd.to_numeric(df["Part Count Target"], errors="coerce").fillna(0)
+    df["Date"] = pd.to_datetime(df["Year"].astype(str) + "-" + df["Month"].astype(str).str.zfill(2) + "-01", errors="coerce")
+    for col in ["EAU Actual", "EAU Target", "Headcount Actual", "Headcount Target", "Part Count Actual", "Part Count Target"]:
+        df[col] = coerce_numeric(df[col]).fillna(0)
+    for col in ["Fishbone Status", "PAAG Status", "Pin Map Status", "AIE Wins Opportunities"]:
+        df[col] = df[col].fillna("").astype(str)
     return df
 
 
 def build_npi_ergo_reds_df(frame: pd.DataFrame) -> pd.DataFrame:
     program_col = find_column(frame, ["NPI", "Program"])
+    factory_col = find_column(frame, ["Site", "Factory"])
+    year_col = find_column(frame, ["Year"])
+    month_col = find_column(frame, ["Month"])
     started_col = find_column(frame, ["Started_Ergo_Assessments", "Started"])
     open_col = find_column(frame, ["Open_Ergo_Assessments", "Open"])
     pending_col = find_column(frame, ["Pending_Ergo_Assessments", "Pending"])
     validation_col = find_column(frame, ["Validation_Ergo_Assessments", "Validation"])
     closed_admin_col = find_column(frame, ["Closed_Ergo_Assessments_Admin", "Closed Administrative"])
     closed_engineering_col = find_column(frame, ["Closed_Ergo_Assessments_Engineering", "Closed Engineering"])
+    wins_col = find_column(frame, ["Ergo_Wins_Opportunities", "Ergo Wins Opportunities"])
     if not all([program_col, started_col, open_col, pending_col, validation_col, closed_admin_col, closed_engineering_col]):
         raise ValueError("NPI ergo reds sheet is missing required columns.")
-    df = frame[[program_col, started_col, open_col, pending_col, validation_col, closed_admin_col, closed_engineering_col]].copy()
-    df.columns = ["Program", "Started", "Open", "Pending", "Validation", "Closed Administrative", "Closed Engineering"]
+    source_columns = [
+        program_col,
+        factory_col or program_col,
+        year_col or program_col,
+        month_col or program_col,
+        started_col,
+        open_col,
+        pending_col,
+        validation_col,
+        closed_admin_col,
+        closed_engineering_col,
+        wins_col or program_col,
+    ]
+    df = frame[source_columns].copy()
+    df.columns = ["Program", "Factory", "Year", "Month", "Started", "Open", "Pending", "Validation", "Closed Administrative", "Closed Engineering", "Ergo Wins Opportunities"]
     df["Program"] = df["Program"].astype(str)
-    for col in df.columns[1:]:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+    df["Factory"] = df["Factory"].astype(str)
+    df["Date"] = pd.to_datetime(df["Year"].astype(str) + "-" + df["Month"].astype(str).str.zfill(2) + "-01", errors="coerce")
+    for col in ["Started", "Open", "Pending", "Validation", "Closed Administrative", "Closed Engineering"]:
+        df[col] = coerce_numeric(df[col]).fillna(0).astype(int)
+    df["Ergo Wins Opportunities"] = df["Ergo Wins Opportunities"].fillna("").astype(str)
     rows = []
     for _, row in df.iterrows():
         for status_col in ["Started", "Open", "Pending", "Validation", "Closed Administrative", "Closed Engineering"]:
-            rows.append({"Program": row["Program"], "Status": status_col, "Count": int(row[status_col])})
+            rows.append(
+                {
+                    "Program": row["Program"],
+                    "Factory": row["Factory"],
+                    "Date": row["Date"],
+                    "Status": status_col,
+                    "Count": int(row[status_col]),
+                    "Ergo Wins Opportunities": row["Ergo Wins Opportunities"],
+                }
+            )
     return pd.DataFrame(rows)
 
 
@@ -284,6 +361,276 @@ def make_npi_reds_chart(frame: pd.DataFrame) -> go.Figure:
     fig = px.bar(summary, x="Program", y="Count", color="Status", barmode="stack")
     fig.update_layout(title="Ergo Reds Status by Program", xaxis_title="Program", yaxis_title="Count")
     return fig
+
+
+def make_npi_comparison_chart(
+    frame: pd.DataFrame,
+    current_col: str,
+    future_col: str,
+    title: str,
+    yaxis_title: str,
+    current_name: str = "Current",
+    future_name: str = "Future",
+    current_color: str = "#B7C9AE",
+    future_color: str = "#5E8F39",
+) -> go.Figure:
+    if frame.empty:
+        return go.Figure()
+    summary = frame.groupby("Program", as_index=False)[[current_col, future_col]].sum()
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=summary["Program"], y=summary[current_col], name=current_name, marker_color=current_color))
+    fig.add_trace(go.Bar(x=summary["Program"], y=summary[future_col], name=future_name, marker_color=future_color))
+    fig.update_layout(
+        title=title,
+        barmode="group",
+        height=290,
+        margin=dict(l=16, r=16, t=52, b=42),
+        xaxis_title="",
+        yaxis_title=yaxis_title,
+        legend=dict(orientation="h", yanchor="top", y=-0.28, xanchor="center", x=0.5),
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+    )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(gridcolor="#E6EAF0", zeroline=False)
+    return fig
+
+
+def make_npi_detail_snapshot_chart(frame: pd.DataFrame) -> go.Figure:
+    if frame.empty:
+        return go.Figure()
+    order = ["Started", "Open", "Pending", "Validation", "Closed Administrative", "Closed Engineering"]
+    display_labels = {
+        "Started": "Started",
+        "Open": "Open",
+        "Pending": "Pending",
+        "Validation": "Validation",
+        "Closed Administrative": "Closed Admin",
+        "Closed Engineering": "Closed Eng",
+    }
+    summary = frame.groupby("Status", as_index=False)["Count"].sum()
+    summary["Status"] = pd.Categorical(summary["Status"], categories=order, ordered=True)
+    summary = summary.sort_values("Status")
+    fig = go.Figure(
+        go.Bar(
+            x=summary["Status"].map(display_labels).fillna(summary["Status"].astype(str)),
+            y=summary["Count"],
+            marker_color=["#B9C9AE", "#D98F8F", "#E6C26A", "#A8C596", "#D7DCE3", "#8BA1B8"],
+            text=summary["Count"],
+            textposition="outside",
+        )
+    )
+    fig.update_layout(
+        title="Ergo Reds Snapshot",
+        height=260,
+        margin=dict(l=16, r=16, t=56, b=24),
+        xaxis_title="",
+        yaxis_title="Count",
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+    )
+    fig.update_xaxes(tickangle=0, showgrid=False)
+    max_count = float(summary["Count"].max()) if not summary.empty else 0
+    fig.update_yaxes(range=[0, max_count * 1.2 if max_count else 1], gridcolor="#E6EAF0", zeroline=False)
+    return fig
+
+
+def render_npi_style() -> None:
+    st.markdown(
+        """
+        <style>
+        .npi-header {
+            padding: 0.2rem 0 0.75rem 0;
+            border-bottom: 2px solid #111827;
+            margin-bottom: 0.9rem;
+        }
+        .npi-title {
+            font-size: 2rem;
+            font-weight: 700;
+            line-height: 1.05;
+            color: #111827;
+        }
+        .npi-subtitle {
+            font-size: 1rem;
+            font-weight: 600;
+            color: #1f2937;
+            margin-top: 0.15rem;
+        }
+        .npi-meta {
+            font-size: 0.9rem;
+            color: #475569;
+            margin-top: 0.15rem;
+        }
+        .summary-card {
+            border-radius: 12px;
+            padding: 0.8rem 0.9rem;
+            min-height: 92px;
+            box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.22);
+        }
+        .summary-label {
+            font-size: 0.9rem;
+            font-weight: 700;
+            color: #111827;
+            margin-bottom: 0.15rem;
+        }
+        .summary-value {
+            font-size: 1.95rem;
+            font-weight: 800;
+            color: #0f172a;
+            line-height: 1.05;
+        }
+        .summary-context {
+            font-size: 0.82rem;
+            color: #475569;
+            margin-top: 0.2rem;
+        }
+        .summary-card.progress { background: #e7ebf1; }
+        .summary-card.green { background: #ddf5df; }
+        .summary-card.red { background: #f8dddd; }
+        .status-title {
+            text-align: center;
+            font-size: 0.85rem;
+            font-weight: 700;
+            color: #475569;
+            margin-bottom: 0.4rem;
+        }
+        .status-orb {
+            width: 124px;
+            height: 124px;
+            border-radius: 999px;
+            margin: 0 auto 0.45rem auto;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            padding: 1rem;
+            font-size: 0.86rem;
+            font-weight: 700;
+            color: #1f2937;
+            border: 1px solid rgba(148, 163, 184, 0.28);
+        }
+        .status-finished { background: #9ba8ab; color: white; }
+        .status-progress { background: linear-gradient(90deg, #e9edf2 50%, #9ba8ab 50%); }
+        .status-notstarted { background: #eef2f6; }
+        .wins-card {
+            border-radius: 10px;
+            padding: 0.8rem 0.9rem;
+            background: #fbfcfe;
+            border: 1px solid #d8dee8;
+            min-height: 108px;
+        }
+        .wins-title {
+            font-weight: 700;
+            color: #111827;
+            margin-bottom: 0.3rem;
+        }
+        .wins-body {
+            color: #334155;
+            font-size: 0.88rem;
+            line-height: 1.4;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def format_change(current_value: float, future_value: float) -> str:
+    if not current_value:
+        return "0.0%"
+    return f"{((future_value - current_value) / current_value) * 100:+.1f}%"
+
+
+def summarize_npi_dashboard(metrics_frame: pd.DataFrame, reds_frame: pd.DataFrame) -> dict[str, object]:
+    current_eau = float(metrics_frame["EAU Target"].sum())
+    future_eau = float(metrics_frame["EAU Actual"].sum())
+    current_part = float(metrics_frame["Part Count Target"].sum())
+    future_part = float(metrics_frame["Part Count Actual"].sum())
+    current_headcount = float(metrics_frame["Headcount Target"].sum())
+    future_headcount = float(metrics_frame["Headcount Actual"].sum())
+    current_hpu = (current_headcount * 2080 / current_eau) if current_eau else 0.0
+    future_hpu = (future_headcount * 2080 / future_eau) if future_eau else 0.0
+
+    status_scores = {"Finished": 100, "In Progress": 55, "Not Started": 10}
+    tool_statuses = pd.concat(
+        [
+            metrics_frame["Fishbone Status"],
+            metrics_frame["PAAG Status"],
+            metrics_frame["Pin Map Status"],
+        ],
+        ignore_index=True,
+    )
+    tool_progress = tool_statuses.map(lambda value: status_scores.get(str(value).strip(), 35)).mean() if not tool_statuses.empty else 0
+    open_reds = float(reds_frame.loc[reds_frame["Status"] == "Open", "Count"].sum())
+    total_reds = float(reds_frame["Count"].sum())
+    closure_score = ((total_reds - open_reds) / total_reds * 100) if total_reds else 100
+    hpu_score = min(max(((current_hpu - future_hpu) / current_hpu * 100) if current_hpu else 0, -100), 100)
+    part_score = min(max(((current_part - future_part) / current_part * 100) if current_part else 0, -100), 100)
+    overall_progress = max(0.0, min(100.0, (tool_progress * 0.45) + (closure_score * 0.15) + ((hpu_score + 100) / 2 * 0.2) + ((part_score + 100) / 2 * 0.2)))
+
+    return {
+        "current_eau": current_eau,
+        "future_eau": future_eau,
+        "current_part": current_part,
+        "future_part": future_part,
+        "current_headcount": current_headcount,
+        "future_headcount": future_headcount,
+        "current_hpu": current_hpu,
+        "future_hpu": future_hpu,
+        "part_change": format_change(current_part, future_part),
+        "headcount_change": format_change(current_headcount, future_headcount),
+        "hpu_change": format_change(current_hpu, future_hpu),
+        "overall_progress": overall_progress,
+        "open_reds": int(open_reds),
+    }
+
+
+def make_summary_card(label: str, value: str, context: str, theme: str) -> str:
+    return f"""
+    <div class="summary-card {theme}">
+        <div class="summary-label">{label}</div>
+        <div class="summary-value">{value}</div>
+        <div class="summary-context">{context}</div>
+    </div>
+    """
+
+
+def render_status_orb(label: str, status: str) -> None:
+    normalized = status.strip().lower()
+    css_class = "status-progress"
+    if normalized == "finished":
+        css_class = "status-finished"
+    elif normalized == "not started":
+        css_class = "status-notstarted"
+    st.markdown(
+        f"""
+        <div class="status-title">{label}</div>
+        <div class="status-orb {css_class}">{status}</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def latest_month_label(metrics_frame: pd.DataFrame, reds_frame: pd.DataFrame) -> str:
+    date_series = pd.concat([metrics_frame.get("Date", pd.Series(dtype="datetime64[ns]")), reds_frame.get("Date", pd.Series(dtype="datetime64[ns]"))], ignore_index=True).dropna()
+    if date_series.empty:
+        return "No reporting month"
+    latest_date = pd.to_datetime(date_series).max()
+    return latest_date.strftime("%Y-%m")
+
+
+def collect_note_text(series: pd.Series, fallback: str) -> str:
+    notes = []
+    seen = set()
+    for value in series.fillna("").astype(str):
+        cleaned = re.sub(r"\s+", " ", value).strip(" -")
+        if not cleaned or cleaned.lower() == "nan" or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        notes.append(cleaned)
+    if not notes:
+        return fallback
+    return "<br>".join(notes[:3])
 
 
 def ensure_plotly_image_export_ready() -> None:
@@ -438,11 +785,118 @@ def main() -> None:
         npi_reds_filtered = apply_program_filter(npi_reds_df, selected_programs)
 
         st.subheader("NPI Dashboard")
-        st.markdown("### Headcount vs Target")
-        st.plotly_chart(make_npi_headcount_chart(npi_metrics_filtered), use_container_width=True)
+        if npi_metrics_filtered.empty:
+            st.info("No NPI data is available for the selected filters.")
+        else:
+            render_npi_style()
+            summary = summarize_npi_dashboard(npi_metrics_filtered, npi_reds_filtered)
+            program_names = sorted(npi_metrics_filtered["Program"].dropna().unique().tolist())
+            primary_title = program_names[0] if len(program_names) == 1 else f"{len(program_names)} NPI Programs"
+            status_row = npi_metrics_filtered.iloc[0]
+            part_metrics_table = pd.DataFrame(
+                [
+                    {"Metric": "EAU (Annual Demand)", "Current": f"{summary['current_eau']:,.0f}", "Future": f"{summary['future_eau']:,.0f}", "% Difference": format_change(summary["current_eau"], summary["future_eau"])},
+                    {"Metric": "Part Count", "Current": f"{summary['current_part']:,.0f}", "Future": f"{summary['future_part']:,.0f}", "% Difference": summary["part_change"]},
+                    {"Metric": "Parts per EAU", "Current": f"{(summary['current_part'] / summary['current_eau']):.4f}" if summary["current_eau"] else "0.0000", "Future": f"{(summary['future_part'] / summary['future_eau']):.4f}" if summary["future_eau"] else "0.0000", "% Difference": format_change((summary["current_part"] / summary["current_eau"]) if summary["current_eau"] else 0, (summary["future_part"] / summary["future_eau"]) if summary["future_eau"] else 0)},
+                ]
+            )
+            headcount_metrics_table = pd.DataFrame(
+                [
+                    {"Metric": "EAU (Annual Demand)", "Current": f"{summary['current_eau']:,.0f}", "Future": f"{summary['future_eau']:,.0f}", "% Difference": format_change(summary["current_eau"], summary["future_eau"])},
+                    {"Metric": "Headcount", "Current": f"{summary['current_headcount']:,.0f}", "Future": f"{summary['future_headcount']:,.0f}", "% Difference": summary["headcount_change"]},
+                    {"Metric": "HPU (Hours Per Unit)", "Current": f"{summary['current_hpu']:.2f}", "Future": f"{summary['future_hpu']:.2f}", "% Difference": summary["hpu_change"]},
+                ]
+            )
 
-        st.markdown("### Ergo Reds Status")
-        st.plotly_chart(make_npi_reds_chart(npi_reds_filtered), use_container_width=True)
+            st.markdown(
+                f"""
+                <div class="npi-header">
+                    <div class="npi-title">{primary_title}</div>
+                    <div class="npi-subtitle">NPI Progress Report</div>
+                    <div class="npi-meta">Month: {latest_month_label(npi_metrics_filtered, npi_reds_filtered)} | Generated: {pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            card_cols = st.columns(4)
+            card_cols[0].markdown(make_summary_card("Overall Progress", f"{summary['overall_progress']:.1f}/100", "Progress snapshot", "progress"), unsafe_allow_html=True)
+            card_cols[1].markdown(make_summary_card("Part Count Reduction", summary["part_change"], "Change vs current count", "green"), unsafe_allow_html=True)
+            card_cols[2].markdown(make_summary_card("Hours Per Unit", summary["hpu_change"], f"Headcount {summary['headcount_change']}", "green"), unsafe_allow_html=True)
+            card_cols[3].markdown(make_summary_card("Open Ergo Reds", f"{summary['open_reds']}", "Open issues requiring action", "red"), unsafe_allow_html=True)
+
+            upper_left, upper_right = st.columns(2)
+            with upper_left:
+                with st.container(border=True):
+                    st.dataframe(part_metrics_table, use_container_width=True, hide_index=True)
+                    st.plotly_chart(
+                        make_npi_comparison_chart(
+                            npi_metrics_filtered,
+                            "Part Count Target",
+                            "Part Count Actual",
+                            "Part Count Reduction",
+                            "Part Count",
+                        ),
+                        use_container_width=True,
+                    )
+            with upper_right:
+                with st.container(border=True):
+                    st.dataframe(headcount_metrics_table, use_container_width=True, hide_index=True)
+                    st.plotly_chart(
+                        make_npi_comparison_chart(
+                            npi_metrics_filtered,
+                            "Headcount Target",
+                            "Headcount Actual",
+                            "Headcount Reduction",
+                            "Headcount",
+                            current_color="#B5CAE3",
+                            future_color="#5B82B1",
+                        ),
+                        use_container_width=True,
+                    )
+
+            lower_left, lower_right = st.columns(2)
+            with lower_left:
+                with st.container(border=True):
+                    st.markdown("**Process Planning Tools**")
+                    status_cols = st.columns(3)
+                    with status_cols[0]:
+                        render_status_orb("Fishbone", str(status_row["Fishbone Status"]))
+                    with status_cols[1]:
+                        render_status_orb("At-a-Glance", str(status_row["PAAG Status"]))
+                    with status_cols[2]:
+                        render_status_orb("Pin Map", str(status_row["Pin Map Status"]))
+            with lower_right:
+                with st.container(border=True):
+                    st.plotly_chart(make_npi_detail_snapshot_chart(npi_reds_filtered), use_container_width=True)
+                    reds_summary = (
+                        npi_reds_filtered.groupby("Status", as_index=False)["Count"].sum()
+                        .sort_values("Status")
+                    )
+                    snapshot_text = ", ".join(f"{row.Status}: {int(row.Count)}" for row in reds_summary.itertuples()) if not reds_summary.empty else "No ergo red details available."
+                    st.caption(snapshot_text)
+
+            wins_cols = st.columns(2)
+            with wins_cols[0]:
+                st.markdown(
+                    f"""
+                    <div class="wins-card">
+                        <div class="wins-title">AIE Wins and Opportunities</div>
+                        <div class="wins-body">{collect_note_text(npi_metrics_filtered["AIE Wins Opportunities"], "No AIE wins or opportunities were provided in the workbook.")}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            with wins_cols[1]:
+                st.markdown(
+                    f"""
+                    <div class="wins-card">
+                        <div class="wins-title">Ergo Wins and Opportunities</div>
+                        <div class="wins-body">{collect_note_text(npi_reds_filtered["Ergo Wins Opportunities"], "No ergo wins or opportunities were provided in the workbook.")}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
     st.sidebar.markdown("---")
     if st.sidebar.button("Export Full Report (PDF)"):
