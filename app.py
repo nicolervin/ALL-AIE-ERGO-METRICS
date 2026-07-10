@@ -20,6 +20,8 @@ SHEET_ALIASES = {
     "ergo_assessments": ["ergo_assessments", "Ergo_Assessments_Risk_Reduction"],
     "risk_projects": ["risk_projects", "Ergo_Assessments_Risk_Reduction"],
     "medical_requests": ["medical_requests", "Medical_Requests"],
+    "workers_comp": ["workers_comp", "Ergo_Workers_Comp"],
+    "dashboard_goals": ["dashboard_goals", "Dashboard_Goals"],
     "npi_metrics": ["npi_metrics", "AIE_NPI"],
     "npi_ergo_reds": ["npi_ergo_reds", "Ergo_NPI"],
 }
@@ -29,9 +31,13 @@ REQUIRED_COLUMNS = {
     "ergo_assessments": ["Factory", "Risk Level", "Count"],
     "risk_projects": ["Factory", "Date", "Reduction Points", "Target Points"],
     "medical_requests": ["Factory", "Status", "Count"],
+    "workers_comp": ["Factory", "Date", "Amount"],
+    "dashboard_goals": ["Year", "Metric", "Goal"],
     "npi_metrics": ["Program", "Factory", "Headcount Actual", "Headcount Target"],
     "npi_ergo_reds": ["Program", "Status", "Count"],
 }
+
+OPTIONAL_SHEETS = {"dashboard_goals"}
 
 
 @st.cache_data(show_spinner=False)
@@ -65,6 +71,8 @@ def load_workbook_data(file_bytes: bytes | None, file_name: str | None = None) -
                 matched_sheet = alias
                 break
         if matched_sheet is None:
+            if dataset_name in OPTIONAL_SHEETS:
+                continue
             errors.append(f"Missing required sheet: {dataset_name}")
             continue
 
@@ -78,6 +86,10 @@ def load_workbook_data(file_bytes: bytes | None, file_name: str | None = None) -
             normalized[dataset_name] = build_risk_project_df(frame)
         elif dataset_name == "medical_requests":
             normalized[dataset_name] = build_medical_requests_df(frame)
+        elif dataset_name == "workers_comp":
+            normalized[dataset_name] = build_workers_comp_df(frame)
+        elif dataset_name == "dashboard_goals":
+            normalized[dataset_name] = build_dashboard_goals_df(frame)
         elif dataset_name == "npi_metrics":
             normalized[dataset_name] = build_npi_metrics_df(frame)
         elif dataset_name == "npi_ergo_reds":
@@ -150,7 +162,9 @@ def build_assessment_df(frame: pd.DataFrame) -> pd.DataFrame:
 
 def build_risk_project_df(frame: pd.DataFrame) -> pd.DataFrame:
     factory_col = find_column(frame, ["Site", "Factory"])
-    date_col = find_column(frame, ["Date", "Month", "Year"])
+    date_col = find_column(frame, ["Date"])
+    year_col = find_column(frame, ["Year"])
+    month_col = find_column(frame, ["Month"])
     reduction_col = find_column(frame, ["Risk_Reduction_Points_This_Month", "Reduction Points"])
     target_col = find_column(frame, ["Target Points", "Target_Points", "Target"])
     if not all([factory_col, reduction_col]):
@@ -159,7 +173,12 @@ def build_risk_project_df(frame: pd.DataFrame) -> pd.DataFrame:
     df.columns = ["Factory", "Reduction Points"]
     df["Factory"] = df["Factory"].astype(str)
     df["Reduction Points"] = pd.to_numeric(df["Reduction Points"], errors="coerce").fillna(0)
-    df["Date"] = pd.to_datetime(frame[date_col] if date_col else pd.Series([pd.Timestamp.today()] * len(frame)))
+    if year_col and month_col:
+        df["Date"] = pd.to_datetime(frame[year_col].astype(str) + "-" + frame[month_col].astype(str).str.zfill(2) + "-01", errors="coerce")
+    elif date_col:
+        df["Date"] = pd.to_datetime(frame[date_col], errors="coerce")
+    else:
+        df["Date"] = pd.Series([pd.Timestamp.today().normalize()] * len(frame))
     if target_col:
         df["Target Points"] = pd.to_numeric(frame[target_col], errors="coerce").fillna(0)
     else:
@@ -187,6 +206,35 @@ def build_medical_requests_df(frame: pd.DataFrame) -> pd.DataFrame:
         rows.append({"Factory": row["Factory"], "Status": "Past Due", "Count": int(row["Past Due"])})
         rows.append({"Factory": row["Factory"], "Status": "Open", "Count": int(row["Open"])})
     return pd.DataFrame(rows)
+
+
+def build_workers_comp_df(frame: pd.DataFrame) -> pd.DataFrame:
+    factory_col = find_column(frame, ["Site", "Factory"])
+    year_col = find_column(frame, ["Year"])
+    month_col = find_column(frame, ["Month"])
+    amount_col = find_column(frame, ["Money_Spent_This_Month", "Amount"])
+    if not all([factory_col, year_col, month_col, amount_col]):
+        raise ValueError("Workers comp sheet is missing required columns.")
+    df = frame[[factory_col, year_col, month_col, amount_col]].copy()
+    df.columns = ["Factory", "Year", "Month", "Amount"]
+    df["Factory"] = df["Factory"].astype(str)
+    df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce").fillna(0)
+    df["Date"] = pd.to_datetime(df["Year"].astype(str) + "-" + df["Month"].astype(str).str.zfill(2) + "-01", errors="coerce")
+    return df[["Factory", "Date", "Amount"]]
+
+
+def build_dashboard_goals_df(frame: pd.DataFrame) -> pd.DataFrame:
+    year_col = find_column(frame, ["Year"])
+    metric_col = find_column(frame, ["Metric"])
+    goal_col = find_column(frame, ["Goal", "Value"])
+    if not all([year_col, metric_col, goal_col]):
+        raise ValueError("Dashboard goals sheet is missing required columns.")
+    df = frame[[year_col, metric_col, goal_col]].copy()
+    df.columns = ["Year", "Metric", "Goal"]
+    df["Year"] = pd.to_numeric(df["Year"], errors="coerce").fillna(0).astype(int)
+    df["Metric"] = df["Metric"].fillna("").astype(str).str.strip()
+    df["Goal"] = coerce_numeric(df["Goal"]).fillna(0)
+    return df[df["Metric"] != ""]
 
 
 def build_npi_metrics_df(frame: pd.DataFrame) -> pd.DataFrame:
@@ -435,6 +483,127 @@ def make_npi_detail_snapshot_chart(frame: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def make_production_trend_chart(frame: pd.DataFrame) -> go.Figure:
+    if frame.empty:
+        return go.Figure()
+    monthly = (
+        frame.groupby(frame["Date"].dt.month)
+        .agg(Injuries=("Injuries", "sum"), Recordable_Rate=("Recordable Rate", "mean"), Dart_Rate=("DART Rate", "mean"))
+        .reindex(range(1, 13), fill_value=0)
+        .reset_index()
+        .rename(columns={"Date": "Month", "index": "Month"})
+    )
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=monthly["Month"], y=monthly["Injuries"], name="2026 Ergo Recordables", marker_color="#2F6DB0"))
+    fig.add_trace(go.Scatter(x=monthly["Month"], y=monthly["Recordable_Rate"], name="RATE 2026 Recordables", mode="lines+markers", yaxis="y2", line=dict(color="#D91E18", width=2.5)))
+    fig.add_trace(go.Scatter(x=monthly["Month"], y=monthly["Dart_Rate"], name="RATE 2026 DART", mode="lines+markers", yaxis="y2", line=dict(color="#F4B400", width=2, dash="dash")))
+    fig.update_layout(
+        title="GE Appliances Ergo Trends",
+        height=320,
+        margin=dict(l=16, r=16, t=44, b=30),
+        barmode="group",
+        legend=dict(orientation="h", yanchor="top", y=-0.22, xanchor="center", x=0.5),
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        xaxis_title="",
+        yaxis_title="Count",
+        yaxis2=dict(title="Rate", overlaying="y", side="right", range=[0, max(monthly["Recordable_Rate"].max(), monthly["Dart_Rate"].max(), 1.2) * 1.2]),
+    )
+    fig.update_xaxes(tickmode="array", tickvals=list(range(1, 13)), ticktext=[str(i) for i in range(1, 13)], showgrid=True, gridcolor="#E6EAF0")
+    fig.update_yaxes(gridcolor="#E6EAF0", zeroline=False)
+    return fig
+
+
+def get_goal_value(goals_frame: pd.DataFrame, year: int, metric_aliases: list[str], default: float = 0.0) -> float:
+    if goals_frame.empty:
+        return default
+    normalized_aliases = {alias.strip().lower() for alias in metric_aliases}
+    matched = goals_frame[
+        (goals_frame["Year"] == year)
+        & (goals_frame["Metric"].str.strip().str.lower().isin(normalized_aliases))
+    ]
+    if matched.empty:
+        return default
+    return float(matched.iloc[0]["Goal"])
+
+
+def make_production_trend_chart(frame: pd.DataFrame, recordable_goal: float = 0.0, dart_goal: float = 0.0) -> go.Figure:
+    if frame.empty:
+        return go.Figure()
+    monthly = (
+        frame.groupby(frame["Date"].dt.month)
+        .agg(Injuries=("Injuries", "sum"), Recordable_Rate=("Recordable Rate", "mean"), Dart_Rate=("DART Rate", "mean"))
+        .reindex(range(1, 13), fill_value=0)
+        .reset_index()
+        .rename(columns={"Date": "Month", "index": "Month"})
+    )
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=monthly["Month"], y=monthly["Injuries"], name="2026 Ergo Recordables", marker_color="#2F6DB0"))
+    fig.add_trace(go.Scatter(x=monthly["Month"], y=monthly["Recordable_Rate"], name="RATE 2026 Recordables", mode="lines+markers", yaxis="y2", line=dict(color="#D91E18", width=2.5)))
+    fig.add_trace(go.Scatter(x=monthly["Month"], y=monthly["Dart_Rate"], name="RATE 2026 DART", mode="lines+markers", yaxis="y2", line=dict(color="#F4B400", width=2, dash="dash")))
+    if recordable_goal:
+        fig.add_trace(go.Scatter(x=monthly["Month"], y=[recordable_goal] * len(monthly), name="Recordable Goal", mode="lines", yaxis="y2", line=dict(color="#8B5CF6", width=2, dash="dot")))
+    if dart_goal:
+        fig.add_trace(go.Scatter(x=monthly["Month"], y=[dart_goal] * len(monthly), name="DART Goal", mode="lines", yaxis="y2", line=dict(color="#16A34A", width=2, dash="dot")))
+    fig.update_layout(
+        title="GE Appliances Ergo Trends",
+        height=320,
+        margin=dict(l=16, r=16, t=44, b=30),
+        barmode="group",
+        legend=dict(orientation="h", yanchor="top", y=-0.22, xanchor="center", x=0.5),
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        xaxis_title="",
+        yaxis_title="Count",
+        yaxis2=dict(title="Rate", overlaying="y", side="right", range=[0, max(monthly["Recordable_Rate"].max(), monthly["Dart_Rate"].max(), recordable_goal, dart_goal, 1.2) * 1.2]),
+    )
+    fig.update_xaxes(tickmode="array", tickvals=list(range(1, 13)), ticktext=[str(i) for i in range(1, 13)], showgrid=True, gridcolor="#E6EAF0")
+    fig.update_yaxes(gridcolor="#E6EAF0", zeroline=False)
+    return fig
+
+
+def make_production_assessment_chart(frame: pd.DataFrame) -> go.Figure:
+    if frame.empty:
+        return go.Figure()
+    counts = frame.groupby("Risk Level", as_index=False)["Count"].sum()
+    fig = px.pie(
+        counts,
+        values="Count",
+        names="Risk Level",
+        color="Risk Level",
+        color_discrete_map={"Red": "#D92D20", "Yellow": "#F4B400", "Green": "#69C466"},
+    )
+    fig.update_traces(textposition="inside", textinfo="percent")
+    fig.update_layout(title="Ergo Assessments", height=255, margin=dict(l=0, r=0, t=32, b=0), showlegend=False, paper_bgcolor="white")
+    return fig
+
+
+def make_production_projects_chart(actual_points: float, goal_points: float, year: int) -> go.Figure:
+    if goal_points <= 0 and actual_points <= 0:
+        return go.Figure()
+    capped_actual = min(actual_points, goal_points) if goal_points > 0 else actual_points
+    remaining_points = max(goal_points - capped_actual, 0)
+    yaxis_top = max(goal_points, actual_points, 1)
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=[str(year)], y=[capped_actual], name="Actual", marker_color="#4D74BE"))
+    if remaining_points > 0:
+        fig.add_trace(go.Bar(x=[str(year)], y=[remaining_points], name="Remaining to Goal", marker_color="#D8E1F0"))
+    fig.update_layout(
+        title="GE App. SC Ergo Risk Reduction",
+        height=250,
+        margin=dict(l=16, r=16, t=44, b=22),
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        barmode="stack",
+        xaxis_title="",
+        yaxis_title="Points",
+        legend=dict(orientation="h", yanchor="top", y=-0.18, xanchor="center", x=0.5),
+    )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(range=[0, yaxis_top], gridcolor="#E6EAF0", zeroline=False)
+    return fig
+
+
 def render_npi_style() -> None:
     st.markdown(
         """
@@ -528,6 +697,82 @@ def render_npi_style() -> None:
             color: #334155;
             font-size: 0.88rem;
             line-height: 1.4;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_production_style() -> None:
+    st.markdown(
+        """
+        <style>
+        .prod-panel-title {
+            font-size: 1.1rem;
+            font-weight: 700;
+            color: #111827;
+            margin-bottom: 0.35rem;
+        }
+        .prod-metric-box {
+            border: 1px solid #d8dee8;
+            background: #fbfcfe;
+            border-radius: 10px;
+            padding: 0.55rem 0.75rem;
+            text-align: center;
+        }
+        .prod-metric-value {
+            font-size: 1.9rem;
+            font-weight: 800;
+            line-height: 1.05;
+        }
+        .prod-metric-red { background: #f7d8da; }
+        .prod-metric-green { background: #d8f1d8; }
+        .prod-metric-yellow { background: #fff0c9; }
+        .prod-metric-neutral { background: #eef2f7; }
+        .prod-kicker {
+            font-size: 0.78rem;
+            color: #475569;
+            margin-top: 0.18rem;
+        }
+        .goal-card, .prod-text-card {
+            border-radius: 10px;
+            border: 1px solid #d8dee8;
+            background: #fbfcfe;
+            padding: 0.75rem 0.85rem;
+            min-height: 250px;
+        }
+        .goal-title, .prod-text-title {
+            font-weight: 700;
+            color: #111827;
+            text-align: center;
+            margin-bottom: 0.45rem;
+        }
+        .goal-year {
+            font-size: 2.25rem;
+            font-weight: 800;
+            text-align: center;
+            margin-bottom: 0.35rem;
+        }
+        .goal-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 1rem;
+            padding: 0.42rem 0;
+            border-top: 1px solid #e6eaf0;
+            font-size: 0.92rem;
+        }
+        .goal-row:first-of-type {
+            border-top: 0;
+        }
+        .goal-value-highlight {
+            background: #fff34a;
+            padding: 0.1rem 0.35rem;
+            font-weight: 800;
+        }
+        .goal-value-bad {
+            color: #b42318;
+            font-weight: 700;
         }
         </style>
         """,
@@ -633,6 +878,102 @@ def collect_note_text(series: pd.Series, fallback: str) -> str:
     return "<br>".join(notes[:3])
 
 
+def summarize_production_dashboard(
+    prod_frame: pd.DataFrame,
+    assessment_frame: pd.DataFrame,
+    project_frame: pd.DataFrame,
+    medical_frame: pd.DataFrame,
+    workers_comp_frame: pd.DataFrame,
+    goals_frame: pd.DataFrame,
+) -> dict[str, object]:
+    assessment_counts = assessment_frame.groupby("Risk Level")["Count"].sum().to_dict()
+    red_count = int(assessment_counts.get("Red", 0))
+    yellow_count = int(assessment_counts.get("Yellow", 0))
+    green_count = int(assessment_counts.get("Green", 0))
+    total_assessments = red_count + yellow_count + green_count
+
+    med_counts = medical_frame.groupby("Status")["Count"].sum().to_dict()
+    closed_requests = int(med_counts.get("Closed", 0))
+    past_due_requests = int(med_counts.get("Past Due", 0))
+    open_requests = int(med_counts.get("Open", 0))
+    total_medical = closed_requests + past_due_requests + open_requests
+
+    latest_date = prod_frame["Date"].max() if not prod_frame.empty else pd.Timestamp.today().normalize()
+    latest_year = latest_date.year if pd.notna(latest_date) else pd.Timestamp.today().year
+    total_reduction = float(project_frame["Reduction Points"].sum())
+    sheet_target_points = float(project_frame["Target Points"].sum())
+    target_points = get_goal_value(
+        goals_frame,
+        latest_year,
+        ["risk_reduction_projects", "risk reduction projects", "risk_reduction_goal", "annual risk reduction goal"],
+        default=sheet_target_points,
+    )
+    progress_fraction = (latest_date.month / 12) if pd.notna(latest_date) else (pd.Timestamp.today().month / 12)
+    expected_progress = target_points * progress_fraction
+    completion_pct = (total_reduction / target_points * 100) if target_points else 0.0
+    remaining_calendar_pct = max(0.0, (1 - progress_fraction) * 100)
+
+    latest_prod = prod_frame.sort_values("Date").iloc[-1] if not prod_frame.empty else None
+    prior_year = pd.DataFrame()
+    if latest_prod is not None:
+        prior_year = prod_frame[
+            (prod_frame["Date"].dt.year == latest_prod["Date"].year - 1)
+            & (prod_frame["Date"].dt.month <= latest_prod["Date"].month)
+        ]
+    current_recordable = float(latest_prod["Recordable Rate"]) if latest_prod is not None else 0.0
+    current_dart = float(latest_prod["DART Rate"]) if latest_prod is not None else 0.0
+    prior_recordable = float(prior_year["Recordable Rate"].mean()) if not prior_year.empty else current_recordable
+    prior_dart = float(prior_year["DART Rate"].mean()) if not prior_year.empty else current_dart
+    total_case_rate = current_recordable + current_dart
+    prior_total_case_rate = prior_recordable + prior_dart
+    recordable_goal = get_goal_value(goals_frame, latest_year, ["recordable_rate", "recordable rate", "injury_trends_recordable_rate_goal"], default=0.0)
+    dart_goal = get_goal_value(goals_frame, latest_year, ["dart_rate", "dart rate", "injury_trends_dart_rate_goal"], default=0.0)
+
+    workers_by_year = pd.DataFrame()
+    current_workers_comp = 0.0
+    prior_workers_comp = 0.0
+    workers_change = 0.0
+    if not workers_comp_frame.empty:
+        workers_by_year = workers_comp_frame.assign(Year=workers_comp_frame["Date"].dt.year).groupby("Year", as_index=False)["Amount"].sum().sort_values("Year")
+        current_workers_comp = float(workers_by_year.iloc[-1]["Amount"])
+        if len(workers_by_year) > 1:
+            prior_workers_comp = float(workers_by_year.iloc[-2]["Amount"])
+        workers_change = ((current_workers_comp - prior_workers_comp) / prior_workers_comp * 100) if prior_workers_comp else 0.0
+
+    return {
+        "red_count": red_count,
+        "yellow_count": yellow_count,
+        "green_count": green_count,
+        "total_assessments": total_assessments,
+        "closed_requests": closed_requests,
+        "past_due_requests": past_due_requests,
+        "open_requests": open_requests,
+        "total_medical": total_medical,
+        "total_reduction": total_reduction,
+        "target_points": target_points,
+        "expected_progress": expected_progress,
+        "completion_pct": completion_pct,
+        "remaining_calendar_pct": remaining_calendar_pct,
+        "current_recordable": current_recordable,
+        "prior_recordable": prior_recordable,
+        "recordable_change": format_change(prior_recordable, current_recordable),
+        "recordable_goal": recordable_goal,
+        "current_dart": current_dart,
+        "prior_dart": prior_dart,
+        "dart_change": format_change(prior_dart, current_dart),
+        "dart_goal": dart_goal,
+        "total_case_rate": total_case_rate,
+        "prior_total_case_rate": prior_total_case_rate,
+        "total_case_change": format_change(prior_total_case_rate, total_case_rate),
+        "workers_by_year": workers_by_year,
+        "current_workers_comp": current_workers_comp,
+        "prior_workers_comp": prior_workers_comp,
+        "workers_change": workers_change,
+        "latest_date": latest_date,
+        "latest_year": latest_year,
+    }
+
+
 def ensure_plotly_image_export_ready() -> None:
     importlib.invalidate_caches()
     try:
@@ -702,6 +1043,19 @@ def main() -> None:
     st.title("Ergonomics and Industrial Engineering Dashboard")
     st.caption("Upload the attached Excel template or use it automatically if it is present in the workspace.")
 
+    template_paths = [
+        Path(__file__).with_name("AIE_Ergo_Dashboard_Template NICOLES VERSION.xlsx"),
+        Path.cwd() / "AIE_Ergo_Dashboard_Template NICOLES VERSION.xlsx",
+    ]
+    template_path = next((path for path in template_paths if path.exists()), None)
+    if template_path is not None:
+        st.sidebar.download_button(
+            "Download Excel template",
+            data=template_path.read_bytes(),
+            file_name=template_path.name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
     uploaded_file = st.sidebar.file_uploader("Upload Excel workbook", type=["xlsx", "xlsm"])
     page = st.sidebar.radio("Page", ["Production Dashboard", "NPI Dashboard"])
     st.sidebar.markdown("---")
@@ -721,10 +1075,12 @@ def main() -> None:
     assessment_df = data.get("ergo_assessments", pd.DataFrame()).copy()
     risk_project_df = data.get("risk_projects", pd.DataFrame()).copy()
     medical_df = data.get("medical_requests", pd.DataFrame()).copy()
+    workers_comp_df = data.get("workers_comp", pd.DataFrame()).copy()
+    dashboard_goals_df = data.get("dashboard_goals", pd.DataFrame()).copy()
     npi_metrics_df = data.get("npi_metrics", pd.DataFrame()).copy()
     npi_reds_df = data.get("npi_ergo_reds", pd.DataFrame()).copy()
 
-    factories = sorted({str(v) for v in pd.concat([prod_df["Factory"], assessment_df["Factory"], risk_project_df["Factory"], medical_df["Factory"], npi_metrics_df["Factory"]], ignore_index=True) if str(v) != "nan" and str(v) != "None"})
+    factories = sorted({str(v) for v in pd.concat([prod_df["Factory"], assessment_df["Factory"], risk_project_df["Factory"], medical_df["Factory"], workers_comp_df["Factory"], npi_metrics_df["Factory"]], ignore_index=True) if str(v) != "nan" and str(v) != "None"})
     programs = sorted({str(v) for v in npi_metrics_df["Program"].dropna() if str(v) != "nan" and str(v) != "None"})
 
     with st.sidebar:
@@ -750,35 +1106,90 @@ def main() -> None:
         assessment_filtered = apply_factory_date_filter(assessment_df, selected_factories, start_date, end_date)
         risk_project_filtered = apply_factory_date_filter(risk_project_df, selected_factories, start_date, end_date)
         medical_filtered = apply_factory_date_filter(medical_df, selected_factories, start_date, end_date)
+        workers_comp_filtered = apply_factory_date_filter(workers_comp_df, selected_factories, start_date, end_date)
 
         st.subheader("Production Dashboard")
-        st.markdown("### Ergo Injury Trends")
-        st.plotly_chart(make_injury_chart(prod_filtered), use_container_width=True)
-
-        st.markdown("### Ergo Assessment Breakdown")
-        st.plotly_chart(make_assessment_chart(assessment_filtered), use_container_width=True)
-
-        st.markdown("### Risk Reduction Projects")
-        if not risk_project_filtered.empty:
-            total_reduction = risk_project_filtered["Reduction Points"].sum()
-            target_points = risk_project_filtered["Target Points"].sum()
-            current_month = pd.Timestamp.today().month if not risk_project_filtered.empty else 1
-            expected_progress = (current_month / 12) * target_points
-            completion_pct = (total_reduction / target_points * 100) if target_points else 0
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Total Reduction Points", f"{total_reduction:,.0f}")
-            col2.metric("Target Points", f"{target_points:,.0f}")
-            col3.metric("% Complete", f"{completion_pct:,.1f}%")
-            col4.metric("On Track", "Yes" if total_reduction >= expected_progress else "No")
+        if prod_filtered.empty:
+            st.info("No production data is available for the selected filters.")
         else:
-            st.info("No risk-project data is available for the selected filters.")
+            render_production_style()
+            summary = summarize_production_dashboard(prod_filtered, assessment_filtered, risk_project_filtered, medical_filtered, workers_comp_filtered, dashboard_goals_df)
+            latest_year = summary["latest_year"]
+            medical_table = pd.DataFrame(
+                [
+                    {"Metric": "Closed Medical Requests (YTD)", "Count": summary["closed_requests"], "% of total": f"{(summary['closed_requests'] / summary['total_medical'] * 100):.0f}%" if summary["total_medical"] else "0%"},
+                    {"Metric": "Past Due Medical Requests", "Count": summary["past_due_requests"], "% of total": f"{(summary['past_due_requests'] / summary['total_medical'] * 100):.0f}%" if summary["total_medical"] else "0%"},
+                    {"Metric": "Open Medical Requests", "Count": summary["open_requests"], "% of total": f"{(summary['open_requests'] / summary['total_medical'] * 100):.0f}%" if summary["total_medical"] else "0%"},
+                ]
+            )
+            injury_table = pd.DataFrame(
+                [
+                    {"Goal": "Recordable Rate", "Current": f"{summary['current_recordable']:.2f}", "Prior": f"{summary['prior_recordable']:.2f}", "Change": summary["recordable_change"]},
+                    {"Goal": "DART Rate", "Current": f"{summary['current_dart']:.2f}", "Prior": f"{summary['prior_dart']:.2f}", "Change": summary["dart_change"]},
+                    {"Goal": "Total Ergo Case Rate", "Current": f"{summary['total_case_rate']:.2f}", "Prior": f"{summary['prior_total_case_rate']:.2f}", "Change": summary["total_case_change"]},
+                ]
+            )
+            workers_table = summary["workers_by_year"].copy()
+            if not workers_table.empty:
+                workers_table["Paid Out"] = workers_table["Amount"].map(lambda value: f"$ {value:,.0f}")
+                workers_table = workers_table[["Year", "Paid Out"]]
 
-        st.markdown("### Medical Requests Status")
-        if not medical_filtered.empty:
-            pivot = pd.pivot_table(medical_filtered, values="Count", index="Factory", columns="Status", aggfunc="sum", fill_value=0)
-            st.dataframe(pivot, use_container_width=True)
-        else:
-            st.info("No medical requests data is available for the selected filters.")
+            top_left, top_right = st.columns([2.4, 1.0])
+            with top_left:
+                with st.container(border=True):
+                    st.plotly_chart(
+                        make_production_trend_chart(
+                            prod_filtered,
+                            recordable_goal=summary["recordable_goal"],
+                            dart_goal=summary["dart_goal"],
+                        ),
+                        use_container_width=True,
+                    )
+            with top_right:
+                with st.container(border=True):
+                    assess_top = st.columns([2.0, 1.0])
+                    with assess_top[0]:
+                        st.plotly_chart(make_production_assessment_chart(assessment_filtered), use_container_width=True)
+                    with assess_top[1]:
+                        st.markdown(f'<div class="prod-metric-box prod-metric-green"><div class="prod-metric-value">{summary["green_count"]}</div><div class="prod-kicker">Green</div></div>', unsafe_allow_html=True)
+                        st.markdown(f'<div class="prod-metric-box prod-metric-yellow"><div class="prod-metric-value">{summary["yellow_count"]}</div><div class="prod-kicker">Yellow</div></div>', unsafe_allow_html=True)
+                        st.markdown(f'<div class="prod-metric-box prod-metric-red"><div class="prod-metric-value">{summary["red_count"]}</div><div class="prod-kicker">Red</div></div>', unsafe_allow_html=True)
+                        st.markdown(f'<div class="prod-metric-box prod-metric-neutral"><div class="prod-metric-value">{summary["total_assessments"]}</div><div class="prod-kicker">Total</div></div>', unsafe_allow_html=True)
+
+            bottom_left, bottom_mid, bottom_right = st.columns([1.35, 0.95, 1.75])
+            with bottom_left:
+                with st.container(border=True):
+                    st.markdown("**SC Ergo Improvement Projects**")
+                    st.plotly_chart(make_production_projects_chart(summary["total_reduction"], summary["target_points"], latest_year), use_container_width=True)
+            with bottom_mid:
+                with st.container(border=True):
+                    on_track = "Yes" if summary["total_reduction"] >= summary["expected_progress"] else "No"
+                    st.markdown(
+                        f"""
+                        <div class="goal-card">
+                            <div class="goal-title">Annual Risk Reduction Goal</div>
+                            <div class="goal-year">{latest_year}</div>
+                            <div class="goal-row"><span>Actual (YTD)</span><span class="goal-value-highlight">{summary['total_reduction']:,.0f}</span></div>
+                            <div class="goal-row"><span>Actual to goal (%)</span><span>{summary['completion_pct']:.1f}%</span></div>
+                            <div class="goal-row"><span>Target to goal (%)</span><span>{summary['remaining_calendar_pct']:.1f}%</span></div>
+                            <div class="goal-row"><span>On track?</span><span class="goal-value-bad">{on_track if on_track == 'No' else 'Yes'}</span></div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+            with bottom_right:
+                with st.container(border=True):
+                    st.markdown("**Medical Requests**")
+                    st.dataframe(medical_table, use_container_width=True, hide_index=True)
+                    st.markdown("**Injury Trend Analysis**")
+                    st.dataframe(injury_table, use_container_width=True, hide_index=True)
+                    st.markdown("**Workers Compensation Ergo Claims Paid Out (YTD)**")
+                    if not workers_table.empty:
+                        st.dataframe(workers_table, use_container_width=True, hide_index=True)
+                        if summary["prior_workers_comp"]:
+                            st.caption(f"Change vs prior year: {summary['workers_change']:+.1f}%")
+                    else:
+                        st.caption("No workers compensation data is available for the selected filters.")
     else:
         npi_metrics_filtered = apply_factory_date_filter(npi_metrics_df, selected_factories, start_date, end_date)
         npi_metrics_filtered = apply_program_filter(npi_metrics_filtered, selected_programs)
