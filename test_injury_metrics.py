@@ -4,7 +4,12 @@ from datetime import date
 
 import pandas as pd
 
-from app import normalize_date_selection
+from app import (
+    filter_injury_history,
+    filter_through_end_month,
+    normalize_date_selection,
+    previous_calendar_month,
+)
 from injury_metrics import aggregate_scope, build_monthly_detail, fiscal_year_start
 from sanitize_workbook import PII_HEADERS, clean_header
 
@@ -47,6 +52,23 @@ class InjuryMetricTests(unittest.TestCase):
     def test_only_completed_months_are_published(self) -> None:
         self.assertEqual(self.latest_month, pd.Timestamp("2026-06-01"))
         self.assertEqual(self.detail["Date"].max(), pd.Timestamp("2026-06-01"))
+
+    def test_previous_month_default_and_trailing_injury_history(self) -> None:
+        default_start, default_end = previous_calendar_month("2026-07-30")
+        self.assertEqual(default_start, pd.Timestamp("2026-06-01"))
+        self.assertEqual(default_end, pd.Timestamp("2026-06-30"))
+
+        monthly = pd.DataFrame(
+            {"Date": pd.date_range("2024-01-01", "2026-06-01", freq="MS")}
+        )
+        history = filter_injury_history(monthly, default_end)
+        self.assertEqual(len(history), 12)
+        self.assertEqual(history["Date"].min(), pd.Timestamp("2025-07-01"))
+        self.assertEqual(history["Date"].max(), pd.Timestamp("2026-06-01"))
+
+        summary_history = filter_through_end_month(monthly, default_end)
+        self.assertIn(pd.Timestamp("2025-06-01"), summary_history["Date"].tolist())
+        self.assertEqual(summary_history["Date"].max(), pd.Timestamp("2026-06-01"))
 
     def test_ge_appliances_latest_rolling_metrics(self) -> None:
         metrics = aggregate_scope(self.detail, "GE Appliances")
