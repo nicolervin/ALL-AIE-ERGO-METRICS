@@ -5,10 +5,15 @@ from datetime import date
 import pandas as pd
 
 from app import (
+    apply_scope_ytd_filter,
+    build_assessment_df,
+    default_site_risk_reduction_goals,
     filter_injury_history,
     filter_through_end_month,
+    make_npi_detail_snapshot_chart,
     normalize_date_selection,
     previous_calendar_month,
+    risk_reduction_goal_for_scope,
 )
 from injury_metrics import aggregate_scope, build_monthly_detail, fiscal_year_start
 from sanitize_workbook import PII_HEADERS, clean_header
@@ -69,6 +74,84 @@ class InjuryMetricTests(unittest.TestCase):
         summary_history = filter_through_end_month(monthly, default_end)
         self.assertIn(pd.Timestamp("2025-06-01"), summary_history["Date"].tolist())
         self.assertEqual(summary_history["Date"].max(), pd.Timestamp("2026-06-01"))
+
+    def test_critical_assessments_remain_separate_from_red(self) -> None:
+        source = pd.DataFrame(
+            {
+                "Factory": ["AP1"],
+                "Year": [2026],
+                "Month": [6],
+                "Critical_Red": [2],
+                "Red": [3],
+                "Yellow": [4],
+                "Green": [5],
+            }
+        )
+        assessments = build_assessment_df(source)
+        counts = assessments.set_index("Risk Level")["Count"].to_dict()
+        self.assertEqual(counts["Critical"], 2)
+        self.assertEqual(counts["Red"], 3)
+        self.assertEqual(sum(counts.values()), 14)
+
+    def test_site_goals_and_risk_reduction_are_year_to_date(self) -> None:
+        projects = pd.DataFrame(
+            {
+                "Factory": ["AP1", "AP1", "AP1", "AP3", "AP3"],
+                "Date": pd.to_datetime(
+                    [
+                        "2025-12-01",
+                        "2026-01-01",
+                        "2026-06-01",
+                        "2026-01-01",
+                        "2026-07-01",
+                    ]
+                ),
+                "Reduction Points": [99, 10, 20, 30, 40],
+                "Target Points": [100, 120, 120, 180, 180],
+            }
+        )
+        ytd = apply_scope_ytd_filter(
+            projects,
+            "GE Appliances",
+            pd.Timestamp("2026-06-30"),
+        )
+        self.assertEqual(ytd["Reduction Points"].sum(), 60)
+        self.assertEqual(ytd["Date"].min(), pd.Timestamp("2026-01-01"))
+        self.assertEqual(ytd["Date"].max(), pd.Timestamp("2026-06-01"))
+
+        goals = default_site_risk_reduction_goals(
+            projects,
+            ["AP1", "AP3", "BODE"],
+            2026,
+        )
+        self.assertEqual(goals, {"AP1": 120.0, "AP3": 180.0, "BODE": 0.0})
+        self.assertEqual(
+            risk_reduction_goal_for_scope(goals, "GE Appliances"),
+            300.0,
+        )
+        self.assertEqual(
+            risk_reduction_goal_for_scope(goals, "AP1"),
+            120.0,
+        )
+
+    def test_npi_ergo_red_status_colors_follow_status_names(self) -> None:
+        reds = pd.DataFrame(
+            {
+                "Status": [
+                    "Closed Engineering",
+                    "Started",
+                    "Validation",
+                    "Closed Administrative",
+                ],
+                "Count": [4, 1, 2, 3],
+            }
+        )
+        chart = make_npi_detail_snapshot_chart(reds)
+        colors = dict(zip(chart.data[0].x, chart.data[0].marker.color))
+        self.assertEqual(colors["Started"], "#9CA3AF")
+        self.assertEqual(colors["Validation"], "#3B82F6")
+        self.assertEqual(colors["Closed Admin"], "#A7D7A9")
+        self.assertEqual(colors["Closed Eng"], "#2E7D32")
 
     def test_ge_appliances_latest_rolling_metrics(self) -> None:
         metrics = aggregate_scope(self.detail, "GE Appliances")
