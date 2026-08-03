@@ -5,11 +5,15 @@ from datetime import date
 import pandas as pd
 
 from app import (
+    apply_factory_date_filter,
     apply_scope_ytd_filter,
+    available_npi_programs,
     build_assessment_df,
+    build_npi_metrics_df,
     default_site_risk_reduction_goals,
     filter_injury_history,
     filter_through_end_month,
+    has_npi_values,
     make_npi_detail_snapshot_chart,
     normalize_date_selection,
     previous_calendar_month,
@@ -198,6 +202,44 @@ class InjuryMetricTests(unittest.TestCase):
         )
         self.assertEqual(start, pd.Timestamp("2026-05-01"))
         self.assertEqual(end, pd.Timestamp("2026-05-01"))
+
+    def test_npi_program_options_include_aie_and_ergo_only_programs(self) -> None:
+        aie = pd.DataFrame({"Program": ["CPO Electric Units"]})
+        ergo = pd.DataFrame({"Program": ["AP1 Summit Washer"]})
+        self.assertEqual(
+            available_npi_programs(aie, ergo),
+            ["AP1 Summit Washer", "CPO Electric Units"],
+        )
+
+    def test_incomplete_npi_aie_row_is_retained_with_missing_values(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "NPI_Name": ["CPO Electric Units"],
+                "Baseline_Headcount": [None],
+                "Future_Headcount": [None],
+            }
+        )
+        metrics = build_npi_metrics_df(frame)
+        self.assertEqual(metrics["Program"].tolist(), ["CPO Electric Units"])
+        self.assertFalse(has_npi_values(metrics, "EAU Target", "EAU Actual"))
+        self.assertTrue(metrics["EAU Target"].isna().all())
+
+    def test_undated_incomplete_npi_row_survives_date_filter(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "Program": ["CPO Electric Units"],
+                "Factory": ["Other"],
+                "Date": [pd.NaT],
+            }
+        )
+        filtered = apply_factory_date_filter(
+            frame,
+            [],
+            pd.Timestamp("2026-07-01"),
+            pd.Timestamp("2026-07-31"),
+            include_undated=True,
+        )
+        self.assertEqual(filtered["Program"].tolist(), ["CPO Electric Units"])
 
 
 if __name__ == "__main__":

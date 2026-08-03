@@ -37,8 +37,8 @@ SHEET_ALIASES = {
     "medical_requests": ["medical_requests", "Medical_Requests"],
     "workers_comp": ["workers_comp", "Ergo_Workers_Comp"],
     "dashboard_goals": ["dashboard_goals", "Dashboard_Goals"],
-    "npi_metrics": ["npi_metrics", "AIE_NPI"],
-    "npi_ergo_reds": ["npi_ergo_reds", "Ergo_NPI"],
+    "npi_metrics": ["npi_metrics", "NPI_AIE", "AIE_NPI"],
+    "npi_ergo_reds": ["npi_ergo_reds", "NPI_Ergo", "Ergo_NPI"],
 }
 
 REQUIRED_COLUMNS = {
@@ -115,11 +115,16 @@ def load_workbook_data(file_bytes: bytes | None, file_name: str | None = None) -
         except Exception as exc:
             errors.append(f"Unable to build injury metrics: {exc}")
 
+    sheet_names_by_key = {
+        str(sheet_name).strip().casefold(): sheet_name
+        for sheet_name in excel_file.sheet_names
+    }
+
     for dataset_name, aliases in SHEET_ALIASES.items():
         matched_sheet = None
         for alias in aliases:
-            if alias in excel_file.sheet_names:
-                matched_sheet = alias
+            matched_sheet = sheet_names_by_key.get(str(alias).strip().casefold())
+            if matched_sheet is not None:
                 break
         if matched_sheet is None:
             if dataset_name in OPTIONAL_SHEETS:
@@ -127,22 +132,25 @@ def load_workbook_data(file_bytes: bytes | None, file_name: str | None = None) -
             errors.append(f"Missing required sheet: {dataset_name}")
             continue
 
-        frame = pd.read_excel(io.BytesIO(bytes_data), sheet_name=matched_sheet, engine="openpyxl")
+        try:
+            frame = pd.read_excel(io.BytesIO(bytes_data), sheet_name=matched_sheet, engine="openpyxl")
 
-        if dataset_name == "ergo_assessments":
-            normalized[dataset_name] = build_assessment_df(frame)
-        elif dataset_name == "risk_projects":
-            normalized[dataset_name] = build_risk_project_df(frame)
-        elif dataset_name == "medical_requests":
-            normalized[dataset_name] = build_medical_requests_df(frame)
-        elif dataset_name == "workers_comp":
-            normalized[dataset_name] = build_workers_comp_df(frame)
-        elif dataset_name == "dashboard_goals":
-            normalized[dataset_name] = build_dashboard_goals_df(frame)
-        elif dataset_name == "npi_metrics":
-            normalized[dataset_name] = build_npi_metrics_df(frame)
-        elif dataset_name == "npi_ergo_reds":
-            normalized[dataset_name] = build_npi_ergo_reds_df(frame)
+            if dataset_name == "ergo_assessments":
+                normalized[dataset_name] = build_assessment_df(frame)
+            elif dataset_name == "risk_projects":
+                normalized[dataset_name] = build_risk_project_df(frame)
+            elif dataset_name == "medical_requests":
+                normalized[dataset_name] = build_medical_requests_df(frame)
+            elif dataset_name == "workers_comp":
+                normalized[dataset_name] = build_workers_comp_df(frame)
+            elif dataset_name == "dashboard_goals":
+                normalized[dataset_name] = build_dashboard_goals_df(frame)
+            elif dataset_name == "npi_metrics":
+                normalized[dataset_name] = build_npi_metrics_df(frame)
+            elif dataset_name == "npi_ergo_reds":
+                normalized[dataset_name] = build_npi_ergo_reds_df(frame)
+        except Exception as exc:
+            errors.append(f"Unable to load sheet {matched_sheet}: {exc}")
 
     if errors:
         return normalized, "\n".join(errors)
@@ -326,12 +334,13 @@ def build_dashboard_goals_df(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_npi_metrics_df(frame: pd.DataFrame) -> pd.DataFrame:
-    program_col = find_column(frame, ["NPI", "Program"])
+    program_col = find_column(frame, ["NPI_Name", "NPI", "Program"])
     factory_col = find_column(frame, ["Site", "Factory"])
     year_col = find_column(frame, ["Year"])
     month_col = find_column(frame, ["Month"])
-    actual_eau_col = find_column(frame, ["Future_EAU_Volume", "EAU Actual", "EAU Current"])
-    target_eau_col = find_column(frame, ["Baseline_EAU-Volume", "EAU Target", "EAU Baseline"])
+    date_col = find_column(frame, ["Completion_Time", "Completion Time", "Start_Time", "Start Time", "Date"])
+    actual_eau_col = find_column(frame, ["Future_EAU", "Future_EAU_Volume", "EAU Actual", "EAU Current"])
+    target_eau_col = find_column(frame, ["Baseline_EAU", "Baseline_EAU-Volume", "EAU Target", "EAU Baseline"])
     actual_headcount_col = find_column(frame, ["Future_Headcount", "Headcount Actual"])
     target_headcount_col = find_column(frame, ["Baseline_Headcount", "Headcount Target"])
     actual_part_col = find_column(frame, ["Future_Part_Count", "Part Count Actual"])
@@ -340,88 +349,82 @@ def build_npi_metrics_df(frame: pd.DataFrame) -> pd.DataFrame:
     paag_col = find_column(frame, ["PAAG_Status", "At-a-Glance_Status", "At-a-Glance Status", "PAAG Status"])
     pin_map_col = find_column(frame, ["Pin_Map_Status", "Pin Map Status"])
     wins_col = find_column(frame, ["AIE_Wins_Opportunities", "AIE Wins Opportunities"])
-    if not all([program_col, factory_col, actual_headcount_col, target_headcount_col]):
+    if not all([program_col, actual_headcount_col, target_headcount_col]):
         raise ValueError("NPI metrics sheet is missing required columns.")
-    source_columns = [
-        program_col,
-        factory_col,
-        year_col or program_col,
-        month_col or program_col,
-        actual_eau_col or actual_headcount_col,
-        target_eau_col or target_headcount_col,
-        actual_headcount_col,
-        target_headcount_col,
-        actual_part_col or target_headcount_col,
-        target_part_col or target_headcount_col,
-        fishbone_col or program_col,
-        paag_col or program_col,
-        pin_map_col or program_col,
-        wins_col or program_col,
-    ]
-    df = frame[source_columns].copy()
-    df.columns = [
-        "Program",
-        "Factory",
-        "Year",
-        "Month",
-        "EAU Actual",
-        "EAU Target",
-        "Headcount Actual",
-        "Headcount Target",
-        "Part Count Actual",
-        "Part Count Target",
-        "Fishbone Status",
-        "PAAG Status",
-        "Pin Map Status",
-        "AIE Wins Opportunities",
-    ]
-    df["Program"] = df["Program"].astype(str)
+    df = pd.DataFrame(
+        {
+            "Program": frame[program_col],
+            "Factory": frame[factory_col] if factory_col else pd.Series("Other", index=frame.index),
+            "EAU Actual": frame[actual_eau_col] if actual_eau_col else pd.Series(float("nan"), index=frame.index),
+            "EAU Target": frame[target_eau_col] if target_eau_col else pd.Series(float("nan"), index=frame.index),
+            "Headcount Actual": frame[actual_headcount_col],
+            "Headcount Target": frame[target_headcount_col],
+            "Part Count Actual": frame[actual_part_col] if actual_part_col else pd.Series(float("nan"), index=frame.index),
+            "Part Count Target": frame[target_part_col] if target_part_col else pd.Series(float("nan"), index=frame.index),
+            "Fishbone Status": frame[fishbone_col] if fishbone_col else pd.Series("", index=frame.index),
+            "PAAG Status": frame[paag_col] if paag_col else pd.Series("", index=frame.index),
+            "Pin Map Status": frame[pin_map_col] if pin_map_col else pd.Series("", index=frame.index),
+            "AIE Wins Opportunities": frame[wins_col] if wins_col else pd.Series("", index=frame.index),
+        },
+        index=frame.index,
+    )
+    if date_col:
+        df["Date"] = pd.to_datetime(frame[date_col], errors="coerce")
+    elif year_col and month_col:
+        df["Date"] = year_month_date(frame, year_col, month_col)
+    else:
+        df["Date"] = pd.Series(pd.NaT, index=frame.index, dtype="datetime64[ns]")
+    df["Program"] = df["Program"].fillna("").astype(str).str.strip()
     df["Factory"] = df["Factory"].map(normalize_site)
-    df["Date"] = year_month_date(df, "Year", "Month")
     for col in ["EAU Actual", "EAU Target", "Headcount Actual", "Headcount Target", "Part Count Actual", "Part Count Target"]:
-        df[col] = coerce_numeric(df[col]).fillna(0)
+        df[col] = coerce_numeric(df[col])
     for col in ["Fishbone Status", "PAAG Status", "Pin Map Status", "AIE Wins Opportunities"]:
         df[col] = df[col].fillna("").astype(str)
-    return df
+    return df[df["Program"] != ""].reset_index(drop=True)
 
 
 def build_npi_ergo_reds_df(frame: pd.DataFrame) -> pd.DataFrame:
-    program_col = find_column(frame, ["NPI", "Program"])
+    program_col = find_column(frame, ["NPI_Name", "NPI", "Program"])
     factory_col = find_column(frame, ["Site", "Factory"])
     year_col = find_column(frame, ["Year"])
     month_col = find_column(frame, ["Month"])
+    date_col = find_column(frame, ["Completion_Time", "Completion Time", "Start_Time", "Start Time", "Date"])
     started_col = find_column(frame, ["Started_Ergo_Assessments", "Started"])
-    open_col = find_column(frame, ["Open_Ergo_Assessments", "Open"])
-    pending_col = find_column(frame, ["Pending_Ergo_Assessments", "Pending"])
-    validation_col = find_column(frame, ["Validation_Ergo_Assessments", "Validation"])
-    closed_admin_col = find_column(frame, ["Closed_Ergo_Assessments_Admin", "Closed Administrative"])
-    closed_engineering_col = find_column(frame, ["Closed_Ergo_Assessments_Engineering", "Closed Engineering"])
+    open_col = find_column(frame, ["Open_Ergo_Reds", "Open_Ergo_Assessments", "Open"])
+    pending_col = find_column(frame, ["Pending_Ergo_Reds", "Pending_Ergo_Assessments", "Pending"])
+    validation_col = find_column(frame, ["Ergo_Assessments_Needing_Final_Validation", "Validation_Ergo_Assessments", "Validation"])
+    closed_admin_col = find_column(frame, ["Ergo_Greens_Admin_solutions", "Closed_Ergo_Assessments_Admin", "Closed Administrative"])
+    closed_engineering_col = find_column(frame, ["Ergo_Greens_Engineering_solutions", "Closed_Ergo_Assessments_Engineering", "Closed Engineering"])
     wins_col = find_column(frame, ["Ergo_Wins_Opportunities", "Ergo Wins Opportunities"])
     if not all([program_col, started_col, open_col, pending_col, validation_col, closed_admin_col, closed_engineering_col]):
         raise ValueError("NPI ergo reds sheet is missing required columns.")
-    source_columns = [
-        program_col,
-        factory_col or program_col,
-        year_col or program_col,
-        month_col or program_col,
-        started_col,
-        open_col,
-        pending_col,
-        validation_col,
-        closed_admin_col,
-        closed_engineering_col,
-        wins_col or program_col,
-    ]
-    df = frame[source_columns].copy()
-    df.columns = ["Program", "Factory", "Year", "Month", "Started", "Open", "Pending", "Validation", "Closed Administrative", "Closed Engineering", "Ergo Wins Opportunities"]
-    df["Program"] = df["Program"].astype(str)
+    df = pd.DataFrame(
+        {
+            "Program": frame[program_col],
+            "Factory": frame[factory_col] if factory_col else pd.Series("Other", index=frame.index),
+            "Started": frame[started_col],
+            "Open": frame[open_col],
+            "Pending": frame[pending_col],
+            "Validation": frame[validation_col],
+            "Closed Administrative": frame[closed_admin_col],
+            "Closed Engineering": frame[closed_engineering_col],
+            "Ergo Wins Opportunities": frame[wins_col] if wins_col else pd.Series("", index=frame.index),
+        },
+        index=frame.index,
+    )
+    if date_col:
+        df["Date"] = pd.to_datetime(frame[date_col], errors="coerce")
+    elif year_col and month_col:
+        df["Date"] = year_month_date(frame, year_col, month_col)
+    else:
+        df["Date"] = pd.Series(pd.NaT, index=frame.index, dtype="datetime64[ns]")
+    df["Program"] = df["Program"].fillna("").astype(str).str.strip()
     df["Factory"] = df["Factory"].map(normalize_site)
-    df["Date"] = year_month_date(df, "Year", "Month")
     for col in ["Started", "Open", "Pending", "Validation", "Closed Administrative", "Closed Engineering"]:
         df[col] = coerce_numeric(df[col]).fillna(0).astype(int)
     df["Ergo Wins Opportunities"] = df["Ergo Wins Opportunities"].fillna("").astype(str)
     rows = []
-    for _, row in df.iterrows():
+    for _, row in df[df["Program"] != ""].iterrows():
         for status_col in ["Started", "Open", "Pending", "Validation", "Closed Administrative", "Closed Engineering"]:
             rows.append(
                 {
@@ -436,14 +439,24 @@ def build_npi_ergo_reds_df(frame: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def apply_factory_date_filter(frame: pd.DataFrame, selected_factories: list[str], start_date: pd.Timestamp | None, end_date: pd.Timestamp | None) -> pd.DataFrame:
+def apply_factory_date_filter(
+    frame: pd.DataFrame,
+    selected_factories: list[str],
+    start_date: pd.Timestamp | None,
+    end_date: pd.Timestamp | None,
+    *,
+    include_undated: bool = False,
+) -> pd.DataFrame:
     if frame.empty:
         return frame
     result = frame.copy()
     if selected_factories:
         result = result[result["Factory"].isin(selected_factories)]
     if "Date" in result.columns and start_date is not None and end_date is not None:
-        result = result[(result["Date"] >= start_date) & (result["Date"] <= end_date)]
+        in_range = (result["Date"] >= start_date) & (result["Date"] <= end_date)
+        if include_undated:
+            in_range = in_range | result["Date"].isna()
+        result = result[in_range]
     return result
 
 
@@ -532,6 +545,26 @@ def apply_program_filter(frame: pd.DataFrame, selected_programs: list[str]) -> p
     if frame.empty or not selected_programs:
         return frame
     return frame[frame["Program"].isin(selected_programs)]
+
+
+def available_npi_programs(*frames: pd.DataFrame) -> list[str]:
+    programs: set[str] = set()
+    for frame in frames:
+        if frame.empty or "Program" not in frame:
+            continue
+        for value in frame["Program"].dropna().astype(str):
+            program = value.strip()
+            if program and program.lower() not in {"nan", "none"}:
+                programs.add(program)
+    return sorted(programs)
+
+
+def has_npi_values(frame: pd.DataFrame, *columns: str) -> bool:
+    return bool(
+        not frame.empty
+        and columns
+        and all(column in frame and frame[column].notna().any() for column in columns)
+    )
 
 
 def normalize_date_selection(
@@ -1224,6 +1257,9 @@ def make_summary_card(label: str, value: str, context: str, theme: str) -> str:
 
 
 def render_status_orb(label: str, status: str) -> None:
+    status = status.strip()
+    if not status or status.lower() in {"nan", "none"}:
+        status = "N/A"
     normalized = status.strip().lower()
     css_class = "status-progress"
     if normalized == "finished":
@@ -2113,7 +2149,7 @@ def main() -> None:
 
     factories = sorted({str(v) for v in pd.concat([assessment_df["Factory"], risk_project_df["Factory"], medical_df["Factory"], workers_comp_df["Factory"], npi_metrics_df["Factory"]], ignore_index=True) if str(v) != "nan" and str(v) != "None"})
     scopes = available_scopes(prod_df)
-    programs = sorted({str(v) for v in npi_metrics_df["Program"].dropna() if str(v) != "nan" and str(v) != "None"})
+    programs = available_npi_programs(npi_metrics_df, npi_reds_df)
     site_risk_reduction_goals: dict[str, float] = {}
 
     with st.sidebar:
@@ -2410,31 +2446,65 @@ def main() -> None:
                 "and Supply Chain counts; no separate hours are available for the Other site."
             )
     else:
-        npi_metrics_filtered = apply_factory_date_filter(npi_metrics_df, selected_factories, start_date, end_date)
+        npi_metrics_filtered = apply_factory_date_filter(
+            npi_metrics_df,
+            selected_factories,
+            start_date,
+            end_date,
+            include_undated=True,
+        )
         npi_metrics_filtered = apply_program_filter(npi_metrics_filtered, selected_programs)
         npi_reds_filtered = apply_program_filter(npi_reds_df, selected_programs)
 
         st.subheader("NPI Dashboard")
-        if npi_metrics_filtered.empty:
+        if npi_metrics_filtered.empty and npi_reds_filtered.empty:
             st.info("No NPI data is available for the selected filters.")
         else:
             render_npi_style()
+            has_aie_data = not npi_metrics_filtered.empty
+            has_ergo_data = not npi_reds_filtered.empty
+            has_eau_data = has_npi_values(npi_metrics_filtered, "EAU Target", "EAU Actual")
+            has_part_data = has_npi_values(npi_metrics_filtered, "Part Count Target", "Part Count Actual")
+            has_headcount_data = has_npi_values(npi_metrics_filtered, "Headcount Target", "Headcount Actual")
+            has_hpu_data = has_eau_data and has_headcount_data
+            has_complete_npi_data = has_eau_data and has_part_data and has_headcount_data and has_ergo_data
             summary = summarize_npi_dashboard(npi_metrics_filtered, npi_reds_filtered)
-            program_names = sorted(npi_metrics_filtered["Program"].dropna().unique().tolist())
+            program_names = available_npi_programs(npi_metrics_filtered, npi_reds_filtered)
             primary_title = program_names[0] if len(program_names) == 1 else f"{len(program_names)} NPI Programs"
-            status_row = npi_metrics_filtered.iloc[0]
+            status_row = (
+                npi_metrics_filtered.iloc[0]
+                if has_aie_data
+                else pd.Series(
+                    {
+                        "Fishbone Status": "N/A",
+                        "PAAG Status": "N/A",
+                        "Pin Map Status": "N/A",
+                    }
+                )
+            )
+            unavailable = "N/A"
+            current_parts_per_eau = (
+                summary["current_part"] / summary["current_eau"]
+                if has_part_data and has_eau_data and summary["current_eau"]
+                else None
+            )
+            future_parts_per_eau = (
+                summary["future_part"] / summary["future_eau"]
+                if has_part_data and has_eau_data and summary["future_eau"]
+                else None
+            )
             part_metrics_table = pd.DataFrame(
                 [
-                    {"Metric": "EAU (Annual Demand)", "Current": f"{summary['current_eau']:,.0f}", "Future": f"{summary['future_eau']:,.0f}", "% Difference": format_change(summary["current_eau"], summary["future_eau"])},
-                    {"Metric": "Part Count", "Current": f"{summary['current_part']:,.0f}", "Future": f"{summary['future_part']:,.0f}", "% Difference": summary["part_change"]},
-                    {"Metric": "Parts per EAU", "Current": f"{(summary['current_part'] / summary['current_eau']):.4f}" if summary["current_eau"] else "0.0000", "Future": f"{(summary['future_part'] / summary['future_eau']):.4f}" if summary["future_eau"] else "0.0000", "% Difference": format_change((summary["current_part"] / summary["current_eau"]) if summary["current_eau"] else 0, (summary["future_part"] / summary["future_eau"]) if summary["future_eau"] else 0)},
+                    {"Metric": "EAU (Annual Demand)", "Current": f"{summary['current_eau']:,.0f}" if has_eau_data else unavailable, "Future": f"{summary['future_eau']:,.0f}" if has_eau_data else unavailable, "% Difference": format_change(summary["current_eau"], summary["future_eau"]) if has_eau_data else unavailable},
+                    {"Metric": "Part Count", "Current": f"{summary['current_part']:,.0f}" if has_part_data else unavailable, "Future": f"{summary['future_part']:,.0f}" if has_part_data else unavailable, "% Difference": summary["part_change"] if has_part_data else unavailable},
+                    {"Metric": "Parts per EAU", "Current": f"{current_parts_per_eau:.4f}" if current_parts_per_eau is not None else unavailable, "Future": f"{future_parts_per_eau:.4f}" if future_parts_per_eau is not None else unavailable, "% Difference": format_change(current_parts_per_eau, future_parts_per_eau) if current_parts_per_eau is not None and future_parts_per_eau is not None else unavailable},
                 ]
             )
             headcount_metrics_table = pd.DataFrame(
                 [
-                    {"Metric": "EAU (Annual Demand)", "Current": f"{summary['current_eau']:,.0f}", "Future": f"{summary['future_eau']:,.0f}", "% Difference": format_change(summary["current_eau"], summary["future_eau"])},
-                    {"Metric": "Headcount", "Current": f"{summary['current_headcount']:,.0f}", "Future": f"{summary['future_headcount']:,.0f}", "% Difference": summary["headcount_change"]},
-                    {"Metric": "HPU (Hours Per Unit)", "Current": f"{summary['current_hpu']:.2f}", "Future": f"{summary['future_hpu']:.2f}", "% Difference": summary["hpu_change"]},
+                    {"Metric": "EAU (Annual Demand)", "Current": f"{summary['current_eau']:,.0f}" if has_eau_data else unavailable, "Future": f"{summary['future_eau']:,.0f}" if has_eau_data else unavailable, "% Difference": format_change(summary["current_eau"], summary["future_eau"]) if has_eau_data else unavailable},
+                    {"Metric": "Headcount", "Current": f"{summary['current_headcount']:,.0f}" if has_headcount_data else unavailable, "Future": f"{summary['future_headcount']:,.0f}" if has_headcount_data else unavailable, "% Difference": summary["headcount_change"] if has_headcount_data else unavailable},
+                    {"Metric": "HPU (Hours Per Unit)", "Current": f"{summary['current_hpu']:.2f}" if has_hpu_data else unavailable, "Future": f"{summary['future_hpu']:.2f}" if has_hpu_data else unavailable, "% Difference": summary["hpu_change"] if has_hpu_data else unavailable},
                 ]
             )
 
@@ -2450,40 +2520,46 @@ def main() -> None:
             )
 
             card_cols = st.columns(4)
-            card_cols[0].markdown(make_summary_card("Overall Progress", f"{summary['overall_progress']:.1f}/100", "Progress snapshot", "progress"), unsafe_allow_html=True)
-            card_cols[1].markdown(make_summary_card("Part Count Reduction", summary["part_change"], "Change vs current count", "green"), unsafe_allow_html=True)
-            card_cols[2].markdown(make_summary_card("Hours Per Unit", summary["hpu_change"], f"Headcount {summary['headcount_change']}", "green"), unsafe_allow_html=True)
-            card_cols[3].markdown(make_summary_card("Open Ergo Reds", f"{summary['open_reds']}", "Open issues requiring action", "red"), unsafe_allow_html=True)
+            card_cols[0].markdown(make_summary_card("Overall Progress", f"{summary['overall_progress']:.1f}/100" if has_complete_npi_data else unavailable, "Progress snapshot" if has_complete_npi_data else "Awaiting complete AIE and ergo data", "progress"), unsafe_allow_html=True)
+            card_cols[1].markdown(make_summary_card("Part Count Reduction", summary["part_change"] if has_part_data else unavailable, "Change vs current count" if has_part_data else "AIE data not available", "green"), unsafe_allow_html=True)
+            card_cols[2].markdown(make_summary_card("Hours Per Unit", summary["hpu_change"] if has_hpu_data else unavailable, f"Headcount {summary['headcount_change']}" if has_hpu_data else "AIE data not available", "green"), unsafe_allow_html=True)
+            card_cols[3].markdown(make_summary_card("Open Ergo Reds", f"{summary['open_reds']}" if has_ergo_data else unavailable, "Open issues requiring action" if has_ergo_data else "Ergo data not available", "red"), unsafe_allow_html=True)
 
             upper_left, upper_right = st.columns(2)
             with upper_left:
                 with st.container(border=True):
                     st.dataframe(part_metrics_table, width="stretch", hide_index=True)
-                    st.plotly_chart(
-                        make_npi_comparison_chart(
-                            npi_metrics_filtered,
-                            "Part Count Target",
-                            "Part Count Actual",
-                            "Part Count Reduction",
-                            "Part Count",
-                        ),
-                        width="stretch",
-                    )
+                    if has_part_data:
+                        st.plotly_chart(
+                            make_npi_comparison_chart(
+                                npi_metrics_filtered,
+                                "Part Count Target",
+                                "Part Count Actual",
+                                "Part Count Reduction",
+                                "Part Count",
+                            ),
+                            width="stretch",
+                        )
+                    else:
+                        st.caption("No AIE part-count data is available for this program.")
             with upper_right:
                 with st.container(border=True):
                     st.dataframe(headcount_metrics_table, width="stretch", hide_index=True)
-                    st.plotly_chart(
-                        make_npi_comparison_chart(
-                            npi_metrics_filtered,
-                            "Headcount Target",
-                            "Headcount Actual",
-                            "Headcount Reduction",
-                            "Headcount",
-                            current_color="#B5CAE3",
-                            future_color="#5B82B1",
-                        ),
-                        width="stretch",
-                    )
+                    if has_headcount_data:
+                        st.plotly_chart(
+                            make_npi_comparison_chart(
+                                npi_metrics_filtered,
+                                "Headcount Target",
+                                "Headcount Actual",
+                                "Headcount Reduction",
+                                "Headcount",
+                                current_color="#B5CAE3",
+                                future_color="#5B82B1",
+                            ),
+                            width="stretch",
+                        )
+                    else:
+                        st.caption("No AIE headcount data is available for this program.")
 
             lower_left, lower_right = st.columns(2)
             with lower_left:
@@ -2498,7 +2574,10 @@ def main() -> None:
                         render_status_orb("Pin Map", str(status_row["Pin Map Status"]))
             with lower_right:
                 with st.container(border=True):
-                    st.plotly_chart(make_npi_detail_snapshot_chart(npi_reds_filtered), width="stretch")
+                    if has_ergo_data:
+                        st.plotly_chart(make_npi_detail_snapshot_chart(npi_reds_filtered), width="stretch")
+                    else:
+                        st.caption("No ergo assessment data is available for this program.")
                     reds_summary = (
                         npi_reds_filtered.groupby("Status", as_index=False)["Count"].sum()
                         .sort_values("Status")
@@ -2531,20 +2610,27 @@ def main() -> None:
     st.sidebar.markdown("---")
     if st.sidebar.button("Build Combined PDF"):
         try:
-            pdf_bytes = render_combined_pdf_report(
-                data,
-                scopes=pdf_scopes,
-                programs=pdf_programs,
-                start_date=start_date,
-                end_date=end_date,
-                site_risk_reduction_goals=site_risk_reduction_goals,
-            )
+            with st.sidebar:
+                with st.spinner(
+                    "Building combined PDF. This may take a moment...",
+                    show_time=True,
+                    width="stretch",
+                ):
+                    pdf_bytes = render_combined_pdf_report(
+                        data,
+                        scopes=pdf_scopes,
+                        programs=pdf_programs,
+                        start_date=start_date,
+                        end_date=end_date,
+                        site_risk_reduction_goals=site_risk_reduction_goals,
+                    )
         except (RuntimeError, ValueError) as exc:
             st.sidebar.error(str(exc))
         else:
             report_end = (
                 end_date.strftime("%Y-%m") if end_date is not None else "latest"
             )
+            st.sidebar.success("Combined PDF is ready to download.")
             st.sidebar.download_button(
                 "Download combined snapshot PDF",
                 data=pdf_bytes,
