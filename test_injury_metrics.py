@@ -10,17 +10,24 @@ from app import (
     available_npi_programs,
     build_assessment_df,
     build_npi_metrics_df,
+    build_risk_reduction_goals_df,
+    default_combined_pdf_sites,
     default_site_risk_reduction_goals,
     filter_injury_history,
     filter_through_end_month,
     has_npi_values,
     latest_npi_snapshots,
+    make_ergo_classification_chart,
     make_npi_detail_snapshot_chart,
     npi_reporting_month,
     normalize_date_selection,
+    open_ergo_reds_status,
     previous_calendar_month,
     reduction_status,
     risk_reduction_goal_for_scope,
+    _snapshot_operational_items,
+    _snapshot_case_table_rows,
+    _snapshot_factory_kpi_items,
 )
 from injury_metrics import aggregate_scope, build_monthly_detail, fiscal_year_start
 from sanitize_workbook import PII_HEADERS, clean_header
@@ -82,6 +89,72 @@ class InjuryMetricTests(unittest.TestCase):
         self.assertIn(pd.Timestamp("2025-06-01"), summary_history["Date"].tolist())
         self.assertEqual(summary_history["Date"].max(), pd.Timestamp("2026-06-01"))
 
+    def test_combined_pdf_defaults_to_all_scopes_except_other(self) -> None:
+        scopes = [
+            "GE Appliances",
+            "Supply Chain",
+            "AP1",
+            "AP2",
+            "Other",
+        ]
+        self.assertEqual(
+            default_combined_pdf_sites(scopes),
+            ["GE Appliances", "Supply Chain", "AP1", "AP2"],
+        )
+
+    def test_pdf_operational_strip_uses_medical_request_labels(self) -> None:
+        items = _snapshot_operational_items(
+            {
+                "closed_requests": 12,
+                "past_due_requests": 3,
+                "latest_year": 2026,
+                "current_workers_comp": 1234,
+            }
+        )
+        self.assertEqual(
+            [item[0] for item in items],
+            [
+                "Closed Medical Requests",
+                "Past-Due Medical Requests",
+                "2026 Workers Comp",
+            ],
+        )
+        self.assertNotIn("Total Assessments", [item[0] for item in items])
+
+    def test_pdf_factory_kpis_show_prior_year_change_and_exclude_hours(self) -> None:
+        items = _snapshot_factory_kpi_items(
+            {
+                "total_case_rate": 3.41,
+                "total_case_change": "-5.0%",
+                "current_recordable": 0.44,
+                "recordable_change": "+2.0%",
+                "current_dart": 0.22,
+                "dart_change": "-1.0%",
+                "current_ehs_recordable": 2.67,
+                "ehs_recordable_change": "+4.0%",
+                "ergo_share": 16.7,
+                "ergo_share_change": "-3.0%",
+            }
+        )
+        self.assertNotIn("Hours", [item[0] for item in items])
+        self.assertTrue(all("vs prior year" in item[2] for item in items))
+
+    def test_pdf_case_table_includes_rates_next_to_counts(self) -> None:
+        summary = {
+            "rolling_hours": 2_000_000,
+            "ergo_all_cases_r12": 40,
+            "ergo_first_aid_r12": 20,
+            "ergo_recordable_r12": 10,
+            "ergo_dafw_r12": 4,
+            "ergo_restricted_r12": 6,
+            "ergo_dart_r12": 10,
+            "ehs_recordables_r12": 30,
+        }
+        rows = _snapshot_case_table_rows(summary)
+        self.assertEqual(rows[0], ["Rolling-12 cases", "Count", "Rate"])
+        self.assertEqual(rows[1], ["All ergonomic cases", "40", "4.00"])
+        self.assertEqual(rows[4], ["DAFW", "4", "0.40"])
+
     def test_critical_assessments_remain_separate_from_red(self) -> None:
         source = pd.DataFrame(
             {
@@ -126,19 +199,28 @@ class InjuryMetricTests(unittest.TestCase):
         self.assertEqual(ytd["Date"].min(), pd.Timestamp("2026-01-01"))
         self.assertEqual(ytd["Date"].max(), pd.Timestamp("2026-06-01"))
 
+        goal_sheet = build_risk_reduction_goals_df(
+            pd.DataFrame(
+                {
+                    "Site": ["AP1", "AP3"],
+                    "Year": [2026, 2026],
+                    "Risk_Reduction_Goals": [170, 300],
+                }
+            )
+        )
         goals = default_site_risk_reduction_goals(
-            projects,
+            goal_sheet,
             ["AP1", "AP3", "BODE"],
             2026,
         )
-        self.assertEqual(goals, {"AP1": 120.0, "AP3": 180.0, "BODE": 0.0})
+        self.assertEqual(goals, {"AP1": 170.0, "AP3": 300.0, "BODE": 0.0})
         self.assertEqual(
             risk_reduction_goal_for_scope(goals, "GE Appliances"),
-            300.0,
+            470.0,
         )
         self.assertEqual(
             risk_reduction_goal_for_scope(goals, "AP1"),
-            120.0,
+            170.0,
         )
 
     def test_npi_ergo_red_status_colors_follow_status_names(self) -> None:
@@ -159,6 +241,19 @@ class InjuryMetricTests(unittest.TestCase):
         self.assertEqual(colors["Validation"], "#3B82F6")
         self.assertEqual(colors["Closed Admin"], "#A7D7A9")
         self.assertEqual(colors["Closed Eng"], "#2E7D32")
+
+    def test_open_ergo_reds_status_is_green_only_at_zero(self) -> None:
+        self.assertEqual(open_ergo_reds_status(0), "green")
+        self.assertEqual(open_ergo_reds_status(1), "red")
+        self.assertEqual(open_ergo_reds_status(12), "red")
+        self.assertEqual(open_ergo_reds_status(0, has_ergo_data=False), "neutral")
+
+    def test_chart_legend_is_reserved_below_plot_area(self) -> None:
+        chart = make_ergo_classification_chart(self.detail)
+        self.assertEqual(chart.layout.legend.orientation, "h")
+        self.assertEqual(chart.layout.legend.yanchor, "top")
+        self.assertLess(chart.layout.legend.y, 0)
+        self.assertGreaterEqual(chart.layout.margin.b, 80)
 
     def test_ge_appliances_latest_rolling_metrics(self) -> None:
         metrics = aggregate_scope(self.detail, "GE Appliances")

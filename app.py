@@ -35,6 +35,7 @@ st.set_page_config(page_title="Ergonomics & Industrial Engineering Dashboard", l
 SHEET_ALIASES = {
     "ergo_assessments": ["ergo_assessments", "Ergo_Assessments_Risk_Reduction"],
     "risk_projects": ["risk_projects", "Ergo_Assessments_Risk_Reduction"],
+    "risk_reduction_goals": ["risk_reduction_goals", "Ergo_Risk_Reduction"],
     "medical_requests": ["medical_requests", "Medical_Requests"],
     "workers_comp": ["workers_comp", "Ergo_Workers_Comp"],
     "dashboard_goals": ["dashboard_goals", "Dashboard_Goals"],
@@ -46,6 +47,7 @@ REQUIRED_COLUMNS = {
     "production_injuries": ["Date", "Factory", "Hours", "Ergo All Cases"],
     "ergo_assessments": ["Factory", "Risk Level", "Count"],
     "risk_projects": ["Factory", "Date", "Reduction Points", "Target Points"],
+    "risk_reduction_goals": ["Factory", "Year", "Goal"],
     "medical_requests": ["Factory", "Status", "Count"],
     "workers_comp": ["Factory", "Date", "Amount"],
     "dashboard_goals": ["Year", "Metric", "Goal"],
@@ -53,7 +55,7 @@ REQUIRED_COLUMNS = {
     "npi_ergo_reds": ["Program", "Status", "Count"],
 }
 
-OPTIONAL_SHEETS = {"dashboard_goals"}
+OPTIONAL_SHEETS = {"dashboard_goals", "risk_reduction_goals"}
 
 
 @st.cache_data(show_spinner=False)
@@ -140,6 +142,8 @@ def load_workbook_data(file_bytes: bytes | None, file_name: str | None = None) -
                 normalized[dataset_name] = build_assessment_df(frame)
             elif dataset_name == "risk_projects":
                 normalized[dataset_name] = build_risk_project_df(frame)
+            elif dataset_name == "risk_reduction_goals":
+                normalized[dataset_name] = build_risk_reduction_goals_df(frame)
             elif dataset_name == "medical_requests":
                 normalized[dataset_name] = build_medical_requests_df(frame)
             elif dataset_name == "workers_comp":
@@ -352,6 +356,30 @@ def build_dashboard_goals_df(frame: pd.DataFrame) -> pd.DataFrame:
     return df[df["Metric"] != ""]
 
 
+def build_risk_reduction_goals_df(frame: pd.DataFrame) -> pd.DataFrame:
+    """Normalize annual site goals from the Ergo_Risk_Reduction sheet."""
+
+    site_col = find_column(frame, ["Site", "Factory"])
+    year_col = find_column(frame, ["Year"])
+    goal_col = find_column(
+        frame,
+        ["Risk_Reduction_Goals", "Risk Reduction Goals", "Annual Goal", "Goal"],
+    )
+    if not all([site_col, year_col, goal_col]):
+        raise ValueError(
+            "Ergo_Risk_Reduction sheet requires Site, Year, and "
+            "Risk_Reduction_Goals columns."
+        )
+    df = frame[[site_col, year_col, goal_col]].copy()
+    df.columns = ["Factory", "Year", "Goal"]
+    df["Factory"] = df["Factory"].map(normalize_site)
+    df["Year"] = pd.to_numeric(df["Year"], errors="coerce")
+    df["Goal"] = coerce_numeric(df["Goal"])
+    df = df.dropna(subset=["Year", "Goal"])
+    df["Year"] = df["Year"].astype(int)
+    return df[df["Factory"] != "Other"]
+
+
 def build_npi_metrics_df(frame: pd.DataFrame) -> pd.DataFrame:
     program_col = find_column(frame, ["NPI_Name", "NPI", "Program"])
     factory_col = find_column(frame, ["Site", "Factory"])
@@ -532,17 +560,20 @@ def default_site_risk_reduction_goals(
     sites: list[str],
     year: int,
 ) -> dict[str, float]:
-    """Seed one annual goal per site from the workbook's repeated goal values."""
+    """Return one annual goal per site from the goals worksheet."""
 
     defaults = {site: 0.0 for site in sites}
-    if frame.empty or "Factory" not in frame or "Target Points" not in frame:
+    if (
+        frame.empty
+        or "Factory" not in frame
+        or "Year" not in frame
+        or "Goal" not in frame
+    ):
         return defaults
-    yearly = frame.copy()
-    if "Date" in yearly:
-        yearly = yearly[yearly["Date"].dt.year == year]
+    yearly = frame[frame["Year"] == year].copy()
     if yearly.empty:
         return defaults
-    workbook_goals = yearly.groupby("Factory")["Target Points"].max().to_dict()
+    workbook_goals = yearly.groupby("Factory")["Goal"].max().to_dict()
     return {
         site: float(workbook_goals.get(site, defaults[site]))
         for site in sites
@@ -564,6 +595,12 @@ def risk_reduction_goal_for_scope(
     else:
         included_sites = {scope: site_goals.get(scope, 0.0)}
     return float(sum(included_sites.values()))
+
+
+def default_combined_pdf_sites(scopes: list[str]) -> list[str]:
+    """Select every factory and aggregate scope except Other by default."""
+
+    return [scope for scope in scopes if scope != "Other"]
 
 
 def apply_program_filter(frame: pd.DataFrame, selected_programs: list[str]) -> pd.DataFrame:
@@ -686,6 +723,18 @@ def make_injury_chart(frame: pd.DataFrame) -> go.Figure:
     return make_production_trend_chart(frame)
 
 
+def below_chart_legend(y: float = -0.24) -> dict[str, object]:
+    """Return a consistent horizontal legend positioned below the plot area."""
+
+    return {
+        "orientation": "h",
+        "yanchor": "top",
+        "y": y,
+        "xanchor": "center",
+        "x": 0.5,
+    }
+
+
 def make_assessment_chart(frame: pd.DataFrame) -> go.Figure:
     if frame.empty:
         return go.Figure()
@@ -706,7 +755,12 @@ def make_assessment_chart(frame: pd.DataFrame) -> go.Figure:
             "Green": "#54A24B",
         },
     )
-    fig.update_layout(title="Ergo Assessment Breakdown")
+    fig.update_layout(
+        title="Ergo Assessment Breakdown",
+        height=330,
+        margin=dict(l=16, r=16, t=44, b=76),
+        legend=below_chart_legend(-0.12),
+    )
     return fig
 
 
@@ -717,7 +771,15 @@ def make_npi_headcount_chart(frame: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Bar(x=summary["Program"], y=summary["Headcount Actual"], name="Actual", marker_color="#4C78A8"))
     fig.add_trace(go.Bar(x=summary["Program"], y=summary["Headcount Target"], name="Target", marker_color="#F58518"))
-    fig.update_layout(title="Headcount vs Target", barmode="group", xaxis_title="Program", yaxis_title="Headcount")
+    fig.update_layout(
+        title="Headcount vs Target",
+        barmode="group",
+        height=330,
+        margin=dict(l=16, r=16, t=44, b=82),
+        xaxis_title="Program",
+        yaxis_title="Headcount",
+        legend=below_chart_legend(),
+    )
     return fig
 
 
@@ -726,7 +788,14 @@ def make_npi_reds_chart(frame: pd.DataFrame) -> go.Figure:
         return go.Figure()
     summary = frame.groupby(["Program", "Status"])["Count"].sum().reset_index()
     fig = px.bar(summary, x="Program", y="Count", color="Status", barmode="stack")
-    fig.update_layout(title="Ergo Reds Status by Program", xaxis_title="Program", yaxis_title="Count")
+    fig.update_layout(
+        title="Ergo Reds Status by Program",
+        height=340,
+        margin=dict(l=16, r=16, t=44, b=90),
+        xaxis_title="Program",
+        yaxis_title="Count",
+        legend=below_chart_legend(),
+    )
     return fig
 
 
@@ -750,11 +819,11 @@ def make_npi_comparison_chart(
     fig.update_layout(
         title=title,
         barmode="group",
-        height=290,
-        margin=dict(l=16, r=16, t=52, b=42),
+        height=330,
+        margin=dict(l=16, r=16, t=52, b=82),
         xaxis_title="",
         yaxis_title=yaxis_title,
-        legend=dict(orientation="h", yanchor="top", y=-0.28, xanchor="center", x=0.5),
+        legend=below_chart_legend(-0.28),
         paper_bgcolor="white",
         plot_bgcolor="white",
     )
@@ -827,10 +896,10 @@ def make_production_trend_chart(frame: pd.DataFrame) -> go.Figure:
     fig.add_trace(go.Scatter(x=monthly["Month"], y=monthly["Dart_Rate"], name="RATE 2026 DART", mode="lines+markers", yaxis="y2", line=dict(color="#F4B400", width=2, dash="dash")))
     fig.update_layout(
         title="GE Appliances Ergo Trends",
-        height=320,
-        margin=dict(l=16, r=16, t=44, b=30),
+        height=390,
+        margin=dict(l=16, r=16, t=44, b=100),
         barmode="group",
-        legend=dict(orientation="h", yanchor="top", y=-0.22, xanchor="center", x=0.5),
+        legend=below_chart_legend(),
         paper_bgcolor="white",
         plot_bgcolor="white",
         xaxis_title="",
@@ -906,9 +975,9 @@ def make_production_trend_chart(
         rate_max = 1.0
     fig.update_layout(
         title="Rolling-12 Injury Trends",
-        height=320,
-        margin=dict(l=16, r=16, t=44, b=30),
-        legend=dict(orientation="h", yanchor="top", y=-0.22, xanchor="center", x=0.5),
+        height=390,
+        margin=dict(l=16, r=16, t=44, b=100),
+        legend=below_chart_legend(),
         paper_bgcolor="white",
         plot_bgcolor="white",
         xaxis_title="",
@@ -940,11 +1009,11 @@ def make_ergo_classification_chart(frame: pd.DataFrame) -> go.Figure:
     fig.update_layout(
         title="Monthly Ergo Cases by Classification",
         barmode="stack",
-        height=300,
-        margin=dict(l=16, r=16, t=44, b=30),
+        height=360,
+        margin=dict(l=16, r=16, t=44, b=90),
         xaxis_title="",
         yaxis_title="Cases",
-        legend=dict(orientation="h", yanchor="top", y=-0.22, xanchor="center", x=0.5),
+        legend=below_chart_legend(),
         paper_bgcolor="white",
         plot_bgcolor="white",
     )
@@ -983,27 +1052,17 @@ def make_pdf_assessment_chart(frame: pd.DataFrame) -> go.Figure:
     fig = make_production_assessment_chart(frame)
     if not fig.data:
         return fig
-    total = int(sum(fig.data[0].values))
     fig.update_traces(
-        hole=0.42,
-        textinfo="label+percent",
+        hole=0,
+        textinfo="percent",
         textposition="inside",
         textfont_size=11,
     )
     fig.update_layout(
-        title="Ergo Assessment Breakdown",
+        title=None,
         height=300,
-        margin=dict(l=0, r=0, t=38, b=0),
+        margin=dict(l=2, r=2, t=2, b=2),
         showlegend=False,
-        annotations=[
-            dict(
-                text=f"Total<br><b>{total:,}</b>",
-                x=0.5,
-                y=0.5,
-                showarrow=False,
-                font=dict(size=13, color="#1F2937"),
-            )
-        ],
     )
     return fig
 
@@ -1020,14 +1079,14 @@ def make_production_projects_chart(actual_points: float, goal_points: float, yea
         fig.add_trace(go.Bar(x=[str(year)], y=[remaining_points], name="Remaining to Goal", marker_color="#D8E1F0"))
     fig.update_layout(
         title="Risk Reduction Progress",
-        height=205,
-        margin=dict(l=16, r=16, t=42, b=20),
+        height=255,
+        margin=dict(l=16, r=16, t=42, b=70),
         paper_bgcolor="white",
         plot_bgcolor="white",
         barmode="stack",
         xaxis_title="",
         yaxis_title="Points",
-        legend=dict(orientation="h", yanchor="top", y=-0.18, xanchor="center", x=0.5),
+        legend=below_chart_legend(-0.18),
     )
     fig.update_xaxes(showgrid=False)
     fig.update_yaxes(range=[0, yaxis_top], gridcolor="#E6EAF0", zeroline=False)
@@ -1270,6 +1329,14 @@ def reduction_status(current_value: float, future_value: float) -> str:
     if future_value > current_value:
         return "red"
     return "yellow"
+
+
+def open_ergo_reds_status(open_reds: float, has_ergo_data: bool = True) -> str:
+    """Classify open ergo reds: zero is favorable; any open item is unfavorable."""
+
+    if not has_ergo_data or pd.isna(open_reds):
+        return "neutral"
+    return "green" if float(open_reds) == 0 else "red"
 
 
 def summarize_npi_dashboard(metrics_frame: pd.DataFrame, reds_frame: pd.DataFrame) -> dict[str, object]:
@@ -1890,6 +1957,166 @@ def _snapshot_risk_reduction_block(
     return block
 
 
+def _snapshot_assessment_block(
+    frame: pd.DataFrame,
+    summary: dict[str, object],
+    styles: dict,
+    width: float = 184,
+) -> Table:
+    """Place the assessment pie and its color-coded counts in one PDF card."""
+
+    chart_width = width - 62
+    chart = _snapshot_chart(
+        make_pdf_assessment_chart(frame),
+        chart_width,
+        142,
+        500,
+        500,
+    )
+    breakdown_rows = [
+        ["Green", f"{summary['green_count']:,}"],
+        ["Yellow", f"{summary['yellow_count']:,}"],
+        ["Red", f"{summary['red_count']:,}"],
+        ["Critical", f"{summary['critical_count']:,}"],
+    ]
+    breakdown = Table(
+        breakdown_rows,
+        colWidths=[36, 26],
+        rowHeights=[35.5] * len(breakdown_rows),
+    )
+    breakdown.setStyle(
+        TableStyle(
+            [
+                ("BOX", (0, 0), (-1, -1), 0.45, PDF_CARD_BORDER),
+                ("INNERGRID", (0, 0), (-1, -1), 1.5, colors.white),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#69C466")),
+                ("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#F4B400")),
+                ("BACKGROUND", (0, 2), (-1, 2), colors.HexColor("#D92D20")),
+                ("BACKGROUND", (0, 3), (-1, 3), colors.HexColor("#6B1E5B")),
+                ("TEXTCOLOR", (0, 0), (-1, 1), PDF_TEXT),
+                ("TEXTCOLOR", (0, 2), (-1, 3), colors.white),
+                ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                ("FONTNAME", (1, 0), (1, -1), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (0, -1), 5.8),
+                ("FONTSIZE", (1, 0), (1, -1), 12),
+                ("ALIGN", (0, 0), (0, -1), "LEFT"),
+                ("ALIGN", (1, 0), (1, -1), "CENTER"),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 2),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+            ]
+        )
+    )
+    body = Table([[chart, breakdown]], colWidths=[chart_width, 62])
+    body.setStyle(
+        TableStyle(
+            [
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ]
+        )
+    )
+    title = Paragraph("<b>Ergo Assessment Breakdown</b>", styles["Small"])
+    block = Table([[title], [body]], colWidths=[width])
+    block.setStyle(
+        TableStyle(
+            [
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
+            ]
+        )
+    )
+    return block
+
+
+def _snapshot_operational_items(
+    summary: dict[str, object],
+) -> list[tuple[str, str, str]]:
+    return [
+        (
+            "Closed Medical Requests",
+            f"{summary['closed_requests']:,}",
+            "Selected period",
+        ),
+        (
+            "Past-Due Medical Requests",
+            f"{summary['past_due_requests']:,}",
+            "Selected period",
+        ),
+        (
+            f"{summary['latest_year']} Workers Comp",
+            f"${summary['current_workers_comp']:,.0f}",
+            "Paid out",
+        ),
+    ]
+
+
+def _snapshot_factory_kpi_items(
+    summary: dict[str, object],
+) -> list[tuple[str, str, str]]:
+    """Build the factory PDF KPI row with prior-year comparisons."""
+
+    return [
+        (
+            "All Ergo Rate",
+            f"{summary['total_case_rate']:.2f}",
+            f"{summary['total_case_change']} vs prior year",
+        ),
+        (
+            "Ergo Recordable",
+            f"{summary['current_recordable']:.2f}",
+            f"{summary['recordable_change']} vs prior year",
+        ),
+        (
+            "Ergo DART",
+            f"{summary['current_dart']:.2f}",
+            f"{summary['dart_change']} vs prior year",
+        ),
+        (
+            "EHS Recordable",
+            f"{summary['current_ehs_recordable']:.2f}",
+            f"{summary['ehs_recordable_change']} vs prior year",
+        ),
+        (
+            "Ergo % of EHS",
+            f"{summary['ergo_share']:.1f}%",
+            f"{summary['ergo_share_change']} vs prior year",
+        ),
+    ]
+
+
+def _snapshot_case_table_rows(summary: dict[str, object]) -> list[list[str]]:
+    """Build rolling-12 case counts and rates for the factory PDF table."""
+
+    hours = float(summary["rolling_hours"])
+
+    def row(label: str, count_key: str) -> list[str]:
+        count = float(summary[count_key])
+        rate = count * 200_000 / hours if hours > 0 else None
+        return [
+            label,
+            f"{count:,.0f}",
+            f"{rate:.2f}" if rate is not None else "N/A",
+        ]
+
+    return [
+        ["Rolling-12 cases", "Count", "Rate"],
+        row("All ergonomic cases", "ergo_all_cases_r12"),
+        row("First aid", "ergo_first_aid_r12"),
+        row("Recordable", "ergo_recordable_r12"),
+        row("DAFW", "ergo_dafw_r12"),
+        row("Restricted", "ergo_restricted_r12"),
+        row("DART", "ergo_dart_r12"),
+        row("All EHS recordables", "ehs_recordables_r12"),
+    ]
+
+
 def _snapshot_header(
     title: str,
     subtitle: str,
@@ -1990,15 +2217,8 @@ def _factory_snapshot_page(
         styles,
     )
     kpis = _snapshot_kpis(
-        [
-            ("All Ergo Rate", f"{summary['total_case_rate']:.2f}", "Rolling 12"),
-            ("Ergo Recordable", f"{summary['current_recordable']:.2f}", "Rolling 12"),
-            ("Ergo DART", f"{summary['current_dart']:.2f}", "Rolling 12"),
-            ("EHS Recordable", f"{summary['current_ehs_recordable']:.2f}", "Rolling 12"),
-            ("Ergo % of EHS", f"{summary['ergo_share']:.1f}%", "Recordables"),
-            ("Hours", f"{summary['rolling_hours']:,.0f}", "Rolling 12"),
-        ],
-        [PDF_NEUTRAL, PDF_RED, PDF_YELLOW, colors.HexColor("#E3EDF7"), PDF_GREEN, PDF_NEUTRAL],
+        _snapshot_factory_kpi_items(summary),
+        [PDF_NEUTRAL, PDF_RED, PDF_YELLOW, colors.HexColor("#E3EDF7"), PDF_GREEN],
     )
     trend = _snapshot_chart(
         make_production_trend_chart(
@@ -2012,17 +2232,8 @@ def _factory_snapshot_page(
         430,
     )
     case_table = _snapshot_table(
-        [
-            ["Rolling-12 cases", "Count"],
-            ["All ergonomic cases", f"{summary['ergo_all_cases_r12']:,.0f}"],
-            ["First aid", f"{summary['ergo_first_aid_r12']:,.0f}"],
-            ["Recordable", f"{summary['ergo_recordable_r12']:,.0f}"],
-            ["DAFW", f"{summary['ergo_dafw_r12']:,.0f}"],
-            ["Restricted", f"{summary['ergo_restricted_r12']:,.0f}"],
-            ["DART", f"{summary['ergo_dart_r12']:,.0f}"],
-            ["All EHS recordables", f"{summary['ehs_recordables_r12']:,.0f}"],
-        ],
-        [170, 68],
+        _snapshot_case_table_rows(summary),
+        [134, 52, 52],
     )
     top_row = _snapshot_card_row(
         [
@@ -2036,8 +2247,11 @@ def _factory_snapshot_page(
         make_ergo_classification_chart(production), 310, 166, 820, 420
     )
     risk_reduction = _snapshot_risk_reduction_block(summary, width=202)
-    assessment_breakdown = _snapshot_chart(
-        make_pdf_assessment_chart(assessments), 184, 166, 520, 420
+    assessment_breakdown = _snapshot_assessment_block(
+        assessments,
+        summary,
+        styles,
+        width=184,
     )
     lower_row = _snapshot_card_row(
         [
@@ -2048,17 +2262,8 @@ def _factory_snapshot_page(
         [322, 214, 196],
     )
     operational_strip = _snapshot_kpis(
-        [
-            ("Total Assessments", f"{summary['total_assessments']:,}", "Selected period"),
-            ("Closed Requests", f"{summary['closed_requests']:,}", "Selected period"),
-            ("Past-Due Requests", f"{summary['past_due_requests']:,}", "Selected period"),
-            (
-                f"{summary['latest_year']} Workers Comp",
-                f"${summary['current_workers_comp']:,.0f}",
-                "Paid out",
-            ),
-        ],
-        [PDF_NEUTRAL, PDF_GREEN, PDF_RED, colors.HexColor("#E3EDF7")],
+        _snapshot_operational_items(summary),
+        [PDF_GREEN, PDF_RED, colors.HexColor("#E3EDF7")],
     )
     return [
         header,
@@ -2122,6 +2327,7 @@ def _npi_snapshot_page(
         if has_headcount_data
         else "neutral"
     )
+    open_reds_status = open_ergo_reds_status(summary["open_reds"], has_ergo_data)
     pdf_status_backgrounds = {
         "green": PDF_GREEN,
         "red": PDF_RED,
@@ -2153,7 +2359,7 @@ def _npi_snapshot_page(
             PDF_NEUTRAL,
             pdf_status_backgrounds[part_reduction_status],
             pdf_status_backgrounds[headcount_reduction_status],
-            PDF_RED,
+            pdf_status_backgrounds[open_reds_status],
         ],
     )
     part_content: object = (
@@ -2406,6 +2612,7 @@ def main() -> None:
     prod_df = data.get("production_injuries", pd.DataFrame()).copy()
     assessment_df = data.get("ergo_assessments", pd.DataFrame()).copy()
     risk_project_df = data.get("risk_projects", pd.DataFrame()).copy()
+    risk_reduction_goals_df = data.get("risk_reduction_goals", pd.DataFrame()).copy()
     medical_df = data.get("medical_requests", pd.DataFrame()).copy()
     workers_comp_df = data.get("workers_comp", pd.DataFrame()).copy()
     dashboard_goals_df = data.get("dashboard_goals", pd.DataFrame()).copy()
@@ -2468,29 +2675,26 @@ def main() -> None:
             for scope in scopes
             if scope not in {"GE Appliances", "Supply Chain", "Other"}
         ]
-        goal_state_key = f"site_risk_reduction_goals_{goal_year}"
-        if goal_state_key not in st.session_state:
-            st.session_state[goal_state_key] = default_site_risk_reduction_goals(
-                risk_project_df,
-                goal_sites,
-                goal_year,
-            )
+        site_risk_reduction_goals = default_site_risk_reduction_goals(
+            risk_reduction_goals_df,
+            goal_sites,
+            goal_year,
+        )
         st.markdown("---")
         st.markdown(f"**{goal_year} Annual Risk Reduction Goals**")
         goal_rows = pd.DataFrame(
             [
                 {
                     "Site": site,
-                    "Annual Goal": st.session_state[goal_state_key].get(site, 0.0),
+                    "Annual Goal": site_risk_reduction_goals.get(site, 0.0),
                 }
                 for site in goal_sites
             ],
             columns=["Site", "Annual Goal"],
         )
-        edited_goal_rows = st.data_editor(
+        st.dataframe(
             goal_rows,
             hide_index=True,
-            disabled=["Site"],
             width="stretch",
             height=min(38 + 35 * max(len(goal_rows), 1), 330),
             column_config={
@@ -2502,15 +2706,26 @@ def main() -> None:
                     format="%.0f",
                 ),
             },
-            key=f"risk_reduction_goal_editor_{goal_year}",
         )
-        site_risk_reduction_goals = {}
-        for row in edited_goal_rows.to_dict("records"):
-            goal_value = pd.to_numeric(row["Annual Goal"], errors="coerce")
-            site_risk_reduction_goals[str(row["Site"])] = (
-                float(goal_value) if pd.notna(goal_value) else 0.0
+        goals_for_selected_year = (
+            risk_reduction_goals_df[
+                risk_reduction_goals_df["Year"] == goal_year
+            ]
+            if not risk_reduction_goals_df.empty
+            else pd.DataFrame()
+        )
+        if risk_reduction_goals_df.empty:
+            st.warning(
+                "No Ergo_Risk_Reduction sheet was found. Add Site, Year, and "
+                "Risk_Reduction_Goals columns to the uploaded workbook."
             )
-        st.session_state[goal_state_key] = site_risk_reduction_goals
+        elif goals_for_selected_year.empty:
+            st.warning(
+                f"Ergo_Risk_Reduction has no {goal_year} rows. Goals will be 0 "
+                "until that year is added to the workbook."
+            )
+        else:
+            st.caption("Loaded from the Ergo_Risk_Reduction workbook tab.")
         selected_scope_goal = risk_reduction_goal_for_scope(
             site_risk_reduction_goals,
             selected_scope,
@@ -2521,18 +2736,23 @@ def main() -> None:
         )
         st.markdown("---")
         st.markdown("**Combined PDF report**")
+        default_pdf_sites = default_combined_pdf_sites(scopes)
         pdf_scopes = st.multiselect(
             "Factory/scope pages",
             scopes,
-            default=[selected_scope],
-            help="Each selected factory or aggregate scope becomes one landscape page.",
+            default=default_pdf_sites,
+            help=(
+                "All sites and aggregate scopes except Other are selected by default. Each "
+                "selected factory or aggregate scope becomes one landscape page."
+            ),
+            key="combined_pdf_scopes_all_except_other",
         )
-        default_pdf_programs = selected_programs if selected_programs else programs
         pdf_programs = st.multiselect(
             "NPI program pages",
             programs,
-            default=default_pdf_programs,
+            default=programs,
             help="Each selected NPI program becomes one landscape page in the same PDF.",
+            key="combined_pdf_programs",
         )
         st.caption(
             f"Planned report: {len(pdf_scopes)} factory page(s) + "
@@ -2571,7 +2791,7 @@ def main() -> None:
                 f"Latest completed month: {summary['latest_date'].strftime('%B %Y')} · "
                 "Rates = rolling-12 cases × 200,000 ÷ rolling-12 hours"
             )
-            metric_columns = st.columns(6)
+            metric_columns = st.columns([1, 1, 1.3, 1, 1])
             metric_columns[0].metric(
                 "All Ergo Rate (R12)",
                 f"{summary['total_case_rate']:.2f}",
@@ -2591,18 +2811,12 @@ def main() -> None:
                 delta_color="inverse",
             )
             metric_columns[3].metric(
-                "Ergo DAFW Rate (R12)",
-                f"{summary['current_dafw']:.2f}",
-                delta=f"{summary['dafw_change']} vs prior year",
-                delta_color="inverse",
-            )
-            metric_columns[4].metric(
                 "Total EHS Recordable Rate",
                 f"{summary['current_ehs_recordable']:.2f}",
                 delta=f"{summary['ehs_recordable_change']} vs prior year",
                 delta_color="inverse",
             )
-            metric_columns[5].metric(
+            metric_columns[4].metric(
                 "Ergo % of EHS Recordables",
                 f"{summary['ergo_share']:.1f}%",
                 delta=f"{summary['ergo_share_change']} vs prior year",
@@ -2753,6 +2967,10 @@ def main() -> None:
                 if has_headcount_data
                 else "neutral"
             )
+            open_reds_status = open_ergo_reds_status(
+                summary["open_reds"],
+                has_ergo_data,
+            )
             program_names = available_npi_programs(npi_metrics_filtered, npi_reds_filtered)
             primary_title = program_names[0] if len(program_names) == 1 else f"{len(program_names)} NPI Programs"
             status_row = (
@@ -2807,7 +3025,7 @@ def main() -> None:
             card_cols[0].markdown(make_summary_card("Overall Progress", f"{summary['overall_progress']:.1f}/100" if has_complete_npi_data else unavailable, "Progress snapshot" if has_complete_npi_data else "Awaiting complete AIE and ergo data", "progress"), unsafe_allow_html=True)
             card_cols[1].markdown(make_summary_card("Part Count Reduction", summary["part_change"] if has_part_data else unavailable, "Change vs current count" if has_part_data else "AIE data not available", part_reduction_status), unsafe_allow_html=True)
             card_cols[2].markdown(make_summary_card("Headcount Reduction", summary["headcount_change"] if has_headcount_data else unavailable, "Change vs current headcount" if has_headcount_data else "AIE data not available", headcount_reduction_status), unsafe_allow_html=True)
-            card_cols[3].markdown(make_summary_card("Open Ergo Reds", f"{summary['open_reds']}" if has_ergo_data else unavailable, "Open issues requiring action" if has_ergo_data else "Ergo data not available", "red"), unsafe_allow_html=True)
+            card_cols[3].markdown(make_summary_card("Open Ergo Reds", f"{summary['open_reds']}" if has_ergo_data else unavailable, ("No open issues" if summary["open_reds"] == 0 else "Open issues requiring action") if has_ergo_data else "Ergo data not available", open_reds_status), unsafe_allow_html=True)
 
             upper_left, upper_right = st.columns(2)
             with upper_left:
