@@ -14,9 +14,12 @@ from app import (
     filter_injury_history,
     filter_through_end_month,
     has_npi_values,
+    latest_npi_snapshots,
     make_npi_detail_snapshot_chart,
+    npi_reporting_month,
     normalize_date_selection,
     previous_calendar_month,
+    reduction_status,
     risk_reduction_goal_for_scope,
 )
 from injury_metrics import aggregate_scope, build_monthly_detail, fiscal_year_start
@@ -240,6 +243,91 @@ class InjuryMetricTests(unittest.TestCase):
             include_undated=True,
         )
         self.assertEqual(filtered["Program"].tolist(), ["CPO Electric Units"])
+
+    def test_npi_timestamp_on_end_date_is_included(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "Program": ["AP1 Nexus Dryer", "Too Late"],
+                "Factory": ["AP1", "AP1"],
+                "Date": [
+                    pd.Timestamp("2026-07-31 13:46"),
+                    pd.Timestamp("2026-08-01 00:00"),
+                ],
+            }
+        )
+        filtered = apply_factory_date_filter(
+            frame,
+            [],
+            pd.Timestamp("2026-07-01"),
+            pd.Timestamp("2026-07-31"),
+        )
+        self.assertEqual(filtered["Program"].tolist(), ["AP1 Nexus Dryer"])
+
+    def test_npi_reporting_month_allows_early_and_late_submissions(self) -> None:
+        submissions = pd.Series(
+            pd.to_datetime(
+                [
+                    "2026-07-27 08:00",
+                    "2026-07-31 13:46",
+                    "2026-08-01 09:00",
+                    "2026-08-07 17:00",
+                    "2026-08-08 09:00",
+                    "2027-01-07 09:00",
+                ]
+            )
+        )
+        reporting_months = npi_reporting_month(submissions)
+        self.assertEqual(
+            reporting_months.tolist(),
+            [
+                pd.Timestamp("2026-07-01"),
+                pd.Timestamp("2026-07-01"),
+                pd.Timestamp("2026-07-01"),
+                pd.Timestamp("2026-07-01"),
+                pd.Timestamp("2026-08-01"),
+                pd.Timestamp("2026-12-01"),
+            ],
+        )
+
+    def test_reduction_status_treats_lower_values_as_favorable(self) -> None:
+        self.assertEqual(reduction_status(100, 90), "green")
+        self.assertEqual(reduction_status(100, 110), "red")
+        self.assertEqual(reduction_status(100, 100), "yellow")
+        self.assertEqual(reduction_status(float("nan"), 100), "neutral")
+
+    def test_latest_npi_snapshot_replaces_earlier_monthly_submission(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "Program": ["AP1 Nexus Dryer", "AP1 Nexus Dryer"],
+                "Date": [pd.Timestamp("2026-07-01")] * 2,
+                "Submission Date": [
+                    pd.Timestamp("2026-07-31 13:46"),
+                    pd.Timestamp("2026-08-03 09:15"),
+                ],
+                "Part Count Actual": [264, 248],
+            }
+        )
+        latest = latest_npi_snapshots(frame)
+        self.assertEqual(latest["Part Count Actual"].tolist(), [248])
+
+    def test_latest_ergo_snapshot_keeps_all_status_rows(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "Program": ["AP1 Nexus Dryer"] * 4,
+                "Date": [pd.Timestamp("2026-07-01")] * 4,
+                "Submission Date": [
+                    pd.Timestamp("2026-07-31 13:46"),
+                    pd.Timestamp("2026-07-31 13:46"),
+                    pd.Timestamp("2026-08-03 09:15"),
+                    pd.Timestamp("2026-08-03 09:15"),
+                ],
+                "Status": ["Open", "Pending", "Open", "Pending"],
+                "Count": [2, 7, 0, 4],
+            }
+        )
+        latest = latest_npi_snapshots(frame)
+        self.assertEqual(latest["Status"].tolist(), ["Open", "Pending"])
+        self.assertEqual(latest["Count"].tolist(), [0, 4])
 
 
 if __name__ == "__main__":

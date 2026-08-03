@@ -14,6 +14,7 @@ from reportlab.lib.pagesizes import landscape, letter
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import (
     Image,
+    KeepTogether,
     PageBreak,
     Paragraph,
     SimpleDocTemplate,
@@ -183,6 +184,24 @@ def year_month_date(
         },
         errors="coerce",
     )
+
+
+def npi_reporting_month(submitted_at: pd.Series) -> pd.Series:
+    """Assign NPI form submissions to their intended monthly reporting period.
+
+    Submissions during the first seven calendar days are treated as late entries
+    for the previous month. Entries in the final five days remain in the current
+    month; submissions outside either edge window also retain their calendar month.
+    """
+
+    submitted_dates = pd.to_datetime(submitted_at, errors="coerce")
+    reporting_months = submitted_dates.dt.to_period("M").dt.to_timestamp()
+    submitted_during_grace_period = submitted_dates.dt.day.between(1, 7)
+    reporting_months.loc[submitted_during_grace_period] = (
+        reporting_months.loc[submitted_during_grace_period]
+        - pd.DateOffset(months=1)
+    )
+    return reporting_months
 
 
 def build_production_df(frame: pd.DataFrame) -> pd.DataFrame:
@@ -369,7 +388,8 @@ def build_npi_metrics_df(frame: pd.DataFrame) -> pd.DataFrame:
         index=frame.index,
     )
     if date_col:
-        df["Date"] = pd.to_datetime(frame[date_col], errors="coerce")
+        df["Submission Date"] = pd.to_datetime(frame[date_col], errors="coerce")
+        df["Date"] = npi_reporting_month(df["Submission Date"])
     elif year_col and month_col:
         df["Date"] = year_month_date(frame, year_col, month_col)
     else:
@@ -413,7 +433,8 @@ def build_npi_ergo_reds_df(frame: pd.DataFrame) -> pd.DataFrame:
         index=frame.index,
     )
     if date_col:
-        df["Date"] = pd.to_datetime(frame[date_col], errors="coerce")
+        df["Submission Date"] = pd.to_datetime(frame[date_col], errors="coerce")
+        df["Date"] = npi_reporting_month(df["Submission Date"])
     elif year_col and month_col:
         df["Date"] = year_month_date(frame, year_col, month_col)
     else:
@@ -431,6 +452,7 @@ def build_npi_ergo_reds_df(frame: pd.DataFrame) -> pd.DataFrame:
                     "Program": row["Program"],
                     "Factory": row["Factory"],
                     "Date": row["Date"],
+                    "Submission Date": row.get("Submission Date", pd.NaT),
                     "Status": status_col,
                     "Count": int(row[status_col]),
                     "Ergo Wins Opportunities": row["Ergo Wins Opportunities"],
@@ -453,9 +475,12 @@ def apply_factory_date_filter(
     if selected_factories:
         result = result[result["Factory"].isin(selected_factories)]
     if "Date" in result.columns and start_date is not None and end_date is not None:
-        in_range = (result["Date"] >= start_date) & (result["Date"] <= end_date)
+        range_start = pd.Timestamp(start_date).normalize()
+        range_end_exclusive = pd.Timestamp(end_date).normalize() + pd.Timedelta(days=1)
+        dates = pd.to_datetime(result["Date"], errors="coerce")
+        in_range = (dates >= range_start) & (dates < range_end_exclusive)
         if include_undated:
-            in_range = in_range | result["Date"].isna()
+            in_range = in_range | dates.isna()
         result = result[in_range]
     return result
 
@@ -565,6 +590,29 @@ def has_npi_values(frame: pd.DataFrame, *columns: str) -> bool:
         and columns
         and all(column in frame and frame[column].notna().any() for column in columns)
     )
+
+
+def latest_npi_snapshots(frame: pd.DataFrame) -> pd.DataFrame:
+    """Keep every row belonging to the latest submission for each NPI program."""
+
+    if frame.empty or "Program" not in frame:
+        return frame
+    result = frame.copy()
+    snapshot_time = (
+        pd.to_datetime(result["Submission Date"], errors="coerce")
+        if "Submission Date" in result
+        else pd.Series(pd.NaT, index=result.index, dtype="datetime64[ns]")
+    )
+    if "Date" in result:
+        snapshot_time = snapshot_time.fillna(
+            pd.to_datetime(result["Date"], errors="coerce")
+        )
+    result["_snapshot_time"] = snapshot_time
+    dated_rows = result["_snapshot_time"].notna()
+    if dated_rows.any():
+        latest_time = result.groupby("Program")["_snapshot_time"].transform("max")
+        result = result[~dated_rows | result["_snapshot_time"].eq(latest_time)]
+    return result.drop(columns="_snapshot_time")
 
 
 def normalize_date_selection(
@@ -1038,6 +1086,8 @@ def render_npi_style() -> None:
         .summary-card.progress { background: #e7ebf1; }
         .summary-card.green { background: #ddf5df; }
         .summary-card.red { background: #f8dddd; }
+        .summary-card.yellow { background: #fff0c9; }
+        .summary-card.neutral { background: #eef2f7; }
         .status-title {
             text-align: center;
             font-size: 0.85rem;
@@ -1200,6 +1250,26 @@ def format_change(current_value: float, future_value: float) -> str:
     if not current_value:
         return "0.0%"
     return f"{((future_value - current_value) / current_value) * 100:+.1f}%"
+
+
+REDUCTION_CHART_COLORS = {
+    "green": "#5E8F39",
+    "red": "#D64545",
+    "yellow": "#D9A600",
+    "neutral": "#9CA3AF",
+}
+
+
+def reduction_status(current_value: float, future_value: float) -> str:
+    """Classify a metric where reducing the future value is favorable."""
+
+    if pd.isna(current_value) or pd.isna(future_value):
+        return "neutral"
+    if future_value < current_value:
+        return "green"
+    if future_value > current_value:
+        return "red"
+    return "yellow"
 
 
 def summarize_npi_dashboard(metrics_frame: pd.DataFrame, reds_frame: pd.DataFrame) -> dict[str, object]:
@@ -1646,6 +1716,70 @@ def _snapshot_chart(
     return Image(image_buffer, width=width, height=height)
 
 
+PDF_CARD_BORDER = colors.HexColor("#D8DEE8")
+PDF_PAGE_BACKGROUND = colors.HexColor("#F4F7FA")
+PDF_TEXT = colors.HexColor("#111827")
+PDF_MUTED_TEXT = colors.HexColor("#475569")
+PDF_BLUE = colors.HexColor("#315B7D")
+PDF_GREEN = colors.HexColor("#DDF5DF")
+PDF_RED = colors.HexColor("#F8DDDD")
+PDF_YELLOW = colors.HexColor("#FFF0C9")
+PDF_NEUTRAL = colors.HexColor("#EEF2F7")
+
+
+def _snapshot_card(
+    content: object,
+    width: float,
+    *,
+    background: colors.Color = colors.white,
+    padding: float = 5,
+) -> Table:
+    table = Table([[content]], colWidths=[width])
+    table.setStyle(
+        TableStyle(
+            [
+                ("BOX", (0, 0), (-1, -1), 0.65, PDF_CARD_BORDER),
+                ("BACKGROUND", (0, 0), (-1, -1), background),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), padding),
+                ("RIGHTPADDING", (0, 0), (-1, -1), padding),
+                ("TOPPADDING", (0, 0), (-1, -1), padding),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), padding),
+            ]
+        )
+    )
+    return table
+
+
+def _snapshot_card_row(
+    cards: list[object],
+    widths: list[float],
+    *,
+    gap: float = 6,
+) -> Table:
+    row: list[object] = []
+    column_widths: list[float] = []
+    for index, (card, width) in enumerate(zip(cards, widths)):
+        if index:
+            row.append("")
+            column_widths.append(gap)
+        row.append(card)
+        column_widths.append(width)
+    table = Table([row], colWidths=column_widths)
+    table.setStyle(
+        TableStyle(
+            [
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ]
+        )
+    )
+    return table
+
+
 def _snapshot_table(
     rows: list[list[object]],
     widths: list[float],
@@ -1655,9 +1789,12 @@ def _snapshot_table(
     table.setStyle(
         TableStyle(
             [
-                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CBD5E1")),
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E7EBF1")),
+                ("BOX", (0, 0), (-1, -1), 0.55, PDF_CARD_BORDER),
+                ("INNERGRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#E3E8EF")),
+                ("BACKGROUND", (0, 0), (-1, 0), PDF_BLUE),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
                 ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("TEXTCOLOR", (0, 1), (-1, -1), PDF_TEXT),
                 ("FONTSIZE", (0, 0), (-1, -1), font_size),
                 ("LEADING", (0, 0), (-1, -1), font_size + 1.5),
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
@@ -1672,43 +1809,52 @@ def _snapshot_table(
     return table
 
 
-def _snapshot_kpis(items: list[tuple[str, str, str]]) -> Table:
-    table = Table(
-        [
-            [label for label, _, _ in items],
-            [value for _, value, _ in items],
-            [context for _, _, context in items],
-        ],
-        colWidths=[744 / len(items)] * len(items),
-    )
-    table.setStyle(
-        TableStyle(
-            [
-                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D8DEE8")),
-                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F4F7FA")),
-                ("FONTNAME", (0, 0), (-1, 1), "Helvetica-Bold"),
-                ("FONTSIZE", (0, 0), (-1, 0), 6.5),
-                ("FONTSIZE", (0, 1), (-1, 1), 14),
-                ("FONTSIZE", (0, 2), (-1, 2), 5.5),
-                ("TEXTCOLOR", (0, 2), (-1, 2), colors.HexColor("#475569")),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("TOPPADDING", (0, 0), (-1, -1), 3),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-            ]
+def _snapshot_kpis(
+    items: list[tuple[str, str, str]],
+    backgrounds: list[colors.Color] | None = None,
+) -> Table:
+    gap = 5
+    card_width = (744 - (gap * (len(items) - 1))) / len(items)
+    card_backgrounds = backgrounds or [PDF_NEUTRAL] * len(items)
+    cards: list[Table] = []
+    for index, (label, value, context) in enumerate(items):
+        card = Table(
+            [[label], [value], [context]],
+            colWidths=[card_width],
         )
-    )
-    return table
+        card.setStyle(
+            TableStyle(
+                [
+                    ("BOX", (0, 0), (-1, -1), 0.55, PDF_CARD_BORDER),
+                    ("BACKGROUND", (0, 0), (-1, -1), card_backgrounds[index]),
+                    ("FONTNAME", (0, 0), (-1, 1), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, 0), 6.4),
+                    ("FONTSIZE", (0, 1), (-1, 1), 14),
+                    ("FONTSIZE", (0, 2), (-1, 2), 5.5),
+                    ("TEXTCOLOR", (0, 0), (-1, 1), PDF_TEXT),
+                    ("TEXTCOLOR", (0, 2), (-1, 2), PDF_MUTED_TEXT),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("TOPPADDING", (0, 0), (-1, -1), 3),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ]
+            )
+        )
+        cards.append(card)
+    return _snapshot_card_row(cards, [card_width] * len(cards), gap=gap)
 
 
-def _snapshot_risk_reduction_block(summary: dict[str, object]) -> Table:
+def _snapshot_risk_reduction_block(
+    summary: dict[str, object],
+    width: float = 210,
+) -> Table:
     chart = _snapshot_chart(
         make_production_projects_chart(
             float(summary["total_reduction"]),
             float(summary["target_points"]),
             int(summary["latest_year"]),
         ),
-        210,
+        width,
         105,
         540,
         280,
@@ -1726,10 +1872,10 @@ def _snapshot_risk_reduction_block(summary: dict[str, object]) -> Table:
             ["Calendar remaining", f"{summary['remaining_calendar_pct']:.1f}%"],
             ["On track", on_track],
         ],
-        [125, 85],
+        [width * 0.6, width * 0.4],
         font_size=6.2,
     )
-    block = Table([[chart], [goal_summary]], colWidths=[210])
+    block = Table([[chart], [goal_summary]], colWidths=[width])
     block.setStyle(
         TableStyle(
             [
@@ -1765,10 +1911,17 @@ def _snapshot_header(
     table.setStyle(
         TableStyle(
             [
+                ("BOX", (0, 0), (-1, -1), 0.65, PDF_CARD_BORDER),
+                ("BACKGROUND", (0, 0), (0, 0), colors.white),
+                ("BACKGROUND", (1, 0), (1, 0), colors.HexColor("#EEF4F8")),
+                ("LINEBEFORE", (0, 0), (0, 0), 4, PDF_BLUE),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
                 ("ALIGN", (1, 0), (1, 0), "RIGHT"),
-                ("LINEBELOW", (0, 0), (-1, -1), 1.2, colors.HexColor("#1F2937")),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("TEXTCOLOR", (0, 0), (-1, -1), PDF_TEXT),
+                ("LEFTPADDING", (0, 0), (-1, -1), 9),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 9),
+                ("TOPPADDING", (0, 0), (-1, -1), 7),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
             ]
         )
     )
@@ -1844,7 +1997,8 @@ def _factory_snapshot_page(
             ("EHS Recordable", f"{summary['current_ehs_recordable']:.2f}", "Rolling 12"),
             ("Ergo % of EHS", f"{summary['ergo_share']:.1f}%", "Recordables"),
             ("Hours", f"{summary['rolling_hours']:,.0f}", "Rolling 12"),
-        ]
+        ],
+        [PDF_NEUTRAL, PDF_RED, PDF_YELLOW, colors.HexColor("#E3EDF7"), PDF_GREEN, PDF_NEUTRAL],
     )
     trend = _snapshot_chart(
         make_production_trend_chart(
@@ -1852,8 +2006,8 @@ def _factory_snapshot_page(
             recordable_goal=summary["recordable_goal"],
             dart_goal=summary["dart_goal"],
         ),
-        488,
-        190,
+        476,
+        184,
         1100,
         430,
     )
@@ -1868,23 +2022,31 @@ def _factory_snapshot_page(
             ["DART", f"{summary['ergo_dart_r12']:,.0f}"],
             ["All EHS recordables", f"{summary['ehs_recordables_r12']:,.0f}"],
         ],
-        [180, 70],
+        [170, 68],
     )
-    top_row = Table([[trend, case_table]], colWidths=[494, 250])
-    top_row.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
+    top_row = _snapshot_card_row(
+        [
+            _snapshot_card(trend, 488),
+            _snapshot_card(case_table, 250),
+        ],
+        [488, 250],
+    )
 
     classifications = _snapshot_chart(
-        make_ergo_classification_chart(production), 326, 170, 820, 420
+        make_ergo_classification_chart(production), 310, 166, 820, 420
     )
-    risk_reduction = _snapshot_risk_reduction_block(summary)
+    risk_reduction = _snapshot_risk_reduction_block(summary, width=202)
     assessment_breakdown = _snapshot_chart(
-        make_pdf_assessment_chart(assessments), 200, 170, 520, 420
+        make_pdf_assessment_chart(assessments), 184, 166, 520, 420
     )
-    lower_row = Table(
-        [[classifications, risk_reduction, assessment_breakdown]],
-        colWidths=[330, 214, 200],
+    lower_row = _snapshot_card_row(
+        [
+            _snapshot_card(classifications, 322),
+            _snapshot_card(risk_reduction, 214),
+            _snapshot_card(assessment_breakdown, 196),
+        ],
+        [322, 214, 196],
     )
-    lower_row.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0), ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
     operational_strip = _snapshot_kpis(
         [
             ("Total Assessments", f"{summary['total_assessments']:,}", "Selected period"),
@@ -1895,13 +2057,8 @@ def _factory_snapshot_page(
                 f"${summary['current_workers_comp']:,.0f}",
                 "Paid out",
             ),
-        ]
-    )
-    methodology = Paragraph(
-        "Rates use rolling-12 cases x 200,000 / rolling-12 hours. DART counts each "
-        "case once when DAFW or restricted. All Ergo includes every unique ergonomic "
-        "case, including first aid.",
-        styles["Small"],
+        ],
+        [PDF_NEUTRAL, PDF_GREEN, PDF_RED, colors.HexColor("#E3EDF7")],
     )
     return [
         header,
@@ -1913,8 +2070,6 @@ def _factory_snapshot_page(
         lower_row,
         Spacer(1, 4),
         operational_strip,
-        Spacer(1, 4),
-        methodology,
     ]
 
 
@@ -1926,110 +2081,209 @@ def _npi_snapshot_page(
     styles: dict,
 ) -> list[object]:
     metrics = apply_factory_date_filter(
-        data.get("npi_metrics", pd.DataFrame()).copy(), [], start_date, end_date
+        data.get("npi_metrics", pd.DataFrame()).copy(),
+        [],
+        start_date,
+        end_date,
+        include_undated=True,
     )
     reds = apply_factory_date_filter(
-        data.get("npi_ergo_reds", pd.DataFrame()).copy(), [], start_date, end_date
+        data.get("npi_ergo_reds", pd.DataFrame()).copy(),
+        [],
+        start_date,
+        end_date,
+        include_undated=True,
     )
     metrics = metrics[metrics["Program"] == program]
     reds = reds[reds["Program"] == program]
-    if metrics.empty:
+    metrics = latest_npi_snapshots(metrics)
+    reds = latest_npi_snapshots(reds)
+    if metrics.empty and reds.empty:
         return []
-    latest_date = metrics["Date"].max()
-    snapshot = metrics[metrics["Date"] == latest_date].head(1).copy()
-    if not reds.empty and reds["Date"].notna().any():
-        reds = reds[reds["Date"] == reds["Date"].max()]
+
+    snapshot = metrics.head(1).copy()
+
+    has_ergo_data = not reds.empty
+    has_eau_data = has_npi_values(snapshot, "EAU Target", "EAU Actual")
+    has_part_data = has_npi_values(snapshot, "Part Count Target", "Part Count Actual")
+    has_headcount_data = has_npi_values(snapshot, "Headcount Target", "Headcount Actual")
+    has_hpu_data = has_eau_data and has_headcount_data
+    has_complete_npi_data = (
+        has_eau_data and has_part_data and has_headcount_data and has_ergo_data
+    )
     summary = summarize_npi_dashboard(snapshot, reds)
-    status = snapshot.iloc[0]
+    part_reduction_status = (
+        reduction_status(summary["current_part"], summary["future_part"])
+        if has_part_data
+        else "neutral"
+    )
+    headcount_reduction_status = (
+        reduction_status(summary["current_headcount"], summary["future_headcount"])
+        if has_headcount_data
+        else "neutral"
+    )
+    pdf_status_backgrounds = {
+        "green": PDF_GREEN,
+        "red": PDF_RED,
+        "yellow": PDF_YELLOW,
+        "neutral": PDF_NEUTRAL,
+    }
+    status = snapshot.iloc[0] if not snapshot.empty else pd.Series(dtype=object)
+    unavailable = "N/A"
+
+    def status_value(column: str) -> str:
+        value = str(status.get(column, "")).strip()
+        return value if value and value.lower() not in {"nan", "none"} else unavailable
+
     header = _snapshot_header(
         program,
         "NPI Progress Report",
-        f"<b>Snapshot month</b><br/>{latest_date.strftime('%B %Y')}<br/>"
+        f"<b>Snapshot month</b><br/>{latest_month_label(snapshot, reds)}<br/>"
         f"Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}",
         styles,
     )
     kpis = _snapshot_kpis(
         [
-            ("Overall Progress", f"{summary['overall_progress']:.1f}/100", "Progress snapshot"),
-            ("Part Count", summary["part_change"], "Current to future"),
-            ("Hours Per Unit", summary["hpu_change"], "Current to future"),
-            ("Open Ergo Reds", f"{summary['open_reds']}", "Open issues" if summary["open_reds"] else "No open issues"),
+            ("Overall Progress", f"{summary['overall_progress']:.1f}/100" if has_complete_npi_data else unavailable, "Progress snapshot" if has_complete_npi_data else "Awaiting complete data"),
+            ("Part Count", summary["part_change"] if has_part_data else unavailable, "Current to future" if has_part_data else "AIE data not available"),
+            ("Headcount", summary["headcount_change"] if has_headcount_data else unavailable, "Current to future" if has_headcount_data else "AIE data not available"),
+            ("Open Ergo Reds", f"{summary['open_reds']}" if has_ergo_data else unavailable, ("Open issues" if summary["open_reds"] else "No open issues") if has_ergo_data else "Ergo data not available"),
+        ],
+        [
+            PDF_NEUTRAL,
+            pdf_status_backgrounds[part_reduction_status],
+            pdf_status_backgrounds[headcount_reduction_status],
+            PDF_RED,
+        ],
+    )
+    part_content: object = (
+        _snapshot_chart(
+            make_npi_comparison_chart(
+                snapshot,
+                "Part Count Target",
+                "Part Count Actual",
+                "Part Count Reduction",
+                "Part Count",
+                future_color=REDUCTION_CHART_COLORS[part_reduction_status],
+            ),
+            357,
+            154,
+            900,
+            400,
+        )
+        if has_part_data
+        else [
+            Paragraph(
+                "<b>Part Count Reduction</b><br/><font color='#64748B'>No AIE part-count data is available for this program.</font>",
+                styles["Small"],
+            ),
+            Spacer(1, 125),
         ]
     )
-    part_chart = _snapshot_chart(
-        make_npi_comparison_chart(
-            snapshot,
-            "Part Count Target",
-            "Part Count Actual",
-            "Part Count Reduction",
-            "Part Count",
-        ),
-        365,
-        160,
-        900,
-        400,
+    headcount_content: object = (
+        _snapshot_chart(
+            make_npi_comparison_chart(
+                snapshot,
+                "Headcount Target",
+                "Headcount Actual",
+                "Headcount Reduction",
+                "Headcount",
+                current_color="#B5CAE3",
+                future_color=REDUCTION_CHART_COLORS[headcount_reduction_status],
+            ),
+            357,
+            154,
+            900,
+            400,
+        )
+        if has_headcount_data
+        else [
+            Paragraph(
+                "<b>Headcount Reduction</b><br/><font color='#64748B'>No AIE headcount data is available for this program.</font>",
+                styles["Small"],
+            ),
+            Spacer(1, 125),
+        ]
     )
-    headcount_chart = _snapshot_chart(
-        make_npi_comparison_chart(
-            snapshot,
-            "Headcount Target",
-            "Headcount Actual",
-            "Headcount Reduction",
-            "Headcount",
-            current_color="#B5CAE3",
-            future_color="#5B82B1",
-        ),
-        365,
-        160,
-        900,
-        400,
+    charts = _snapshot_card_row(
+        [
+            _snapshot_card(part_content, 369),
+            _snapshot_card(headcount_content, 369),
+        ],
+        [369, 369],
     )
-    charts = Table([[part_chart, headcount_chart]], colWidths=[372, 372])
-    charts.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
     metrics_table = _snapshot_table(
         [
             ["Metric", "Current", "Future", "% Difference"],
-            ["EAU", f"{summary['current_eau']:,.0f}", f"{summary['future_eau']:,.0f}", format_change(summary["current_eau"], summary["future_eau"])],
-            ["Part Count", f"{summary['current_part']:,.0f}", f"{summary['future_part']:,.0f}", summary["part_change"]],
-            ["Headcount", f"{summary['current_headcount']:,.0f}", f"{summary['future_headcount']:,.0f}", summary["headcount_change"]],
-            ["Hours Per Unit", f"{summary['current_hpu']:.2f}", f"{summary['future_hpu']:.2f}", summary["hpu_change"]],
+            ["EAU", f"{summary['current_eau']:,.0f}" if has_eau_data else unavailable, f"{summary['future_eau']:,.0f}" if has_eau_data else unavailable, format_change(summary["current_eau"], summary["future_eau"]) if has_eau_data else unavailable],
+            ["Part Count", f"{summary['current_part']:,.0f}" if has_part_data else unavailable, f"{summary['future_part']:,.0f}" if has_part_data else unavailable, summary["part_change"] if has_part_data else unavailable],
+            ["Headcount", f"{summary['current_headcount']:,.0f}" if has_headcount_data else unavailable, f"{summary['future_headcount']:,.0f}" if has_headcount_data else unavailable, summary["headcount_change"] if has_headcount_data else unavailable],
+            ["Hours Per Unit", f"{summary['current_hpu']:.2f}" if has_hpu_data else unavailable, f"{summary['future_hpu']:.2f}" if has_hpu_data else unavailable, summary["hpu_change"] if has_hpu_data else unavailable],
         ],
-        [100, 75, 75, 90],
+        [96, 72, 72, 84],
+    )
+    metrics_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (3, 2), (3, 2), pdf_status_backgrounds[part_reduction_status]),
+                ("BACKGROUND", (3, 3), (3, 3), pdf_status_backgrounds[headcount_reduction_status]),
+            ]
+        )
     )
     process_table = _snapshot_table(
         [
             ["Process planning tool", "Status"],
-            ["Fishbone", str(status["Fishbone Status"])],
-            ["At-a-Glance / PAAG", str(status["PAAG Status"])],
-            ["Pin Map", str(status["Pin Map Status"])],
+            ["Fishbone", status_value("Fishbone Status")],
+            ["At-a-Glance / PAAG", status_value("PAAG Status")],
+            ["Pin Map", status_value("Pin Map Status")],
         ],
-        [190, 150],
+        [180, 144],
     )
-    left_detail = Table([[metrics_table], [process_table]], colWidths=[340])
+    left_detail = Table([[metrics_table], [Spacer(1, 4)], [process_table]], colWidths=[324])
     left_detail.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0), ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]))
-    reds_chart = _snapshot_chart(
-        make_npi_detail_snapshot_chart(reds), 395, 152, 950, 365
+    reds_content: object = (
+        _snapshot_chart(
+            make_npi_detail_snapshot_chart(reds), 390, 150, 950, 365
+        )
+        if has_ergo_data
+        else [
+            Paragraph(
+                "<b>Ergo Reds Snapshot</b><br/><font color='#64748B'>No ergo assessment data is available for this program.</font>",
+                styles["Small"],
+            ),
+            Spacer(1, 115),
+        ]
     )
-    details = Table([[left_detail, reds_chart]], colWidths=[345, 399])
-    details.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
-    notes = Table(
+    details = _snapshot_card_row(
         [
-            [
-                Paragraph(
-                    "<b>AIE Wins and Opportunities</b><br/>"
-                    + _snapshot_note(snapshot["AIE Wins Opportunities"], "No AIE notes provided."),
-                    styles["Small"],
-                ),
-                Paragraph(
-                    "<b>Ergo Wins and Opportunities</b><br/>"
-                    + _snapshot_note(reds.get("Ergo Wins Opportunities", pd.Series(dtype=str)), "No ergo notes provided."),
-                    styles["Small"],
-                ),
-            ]
+            _snapshot_card(left_detail, 336),
+            _snapshot_card(reds_content, 402),
         ],
-        colWidths=[372, 372],
+        [336, 402],
     )
-    notes.setStyle(TableStyle([("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E1")), ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E1")), ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F8FAFC")), ("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 6), ("RIGHTPADDING", (0, 0), (-1, -1), 6), ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]))
+    aie_notes = Paragraph(
+        "<b>AIE Wins and Opportunities</b><br/>"
+        + _snapshot_note(
+            snapshot.get("AIE Wins Opportunities", pd.Series(dtype=str)),
+            "No AIE notes provided.",
+        ),
+        styles["Small"],
+    )
+    ergo_notes = Paragraph(
+        "<b>Ergo Wins and Opportunities</b><br/>"
+        + _snapshot_note(
+            reds.get("Ergo Wins Opportunities", pd.Series(dtype=str)),
+            "No ergo notes provided.",
+        ),
+        styles["Small"],
+    )
+    notes = _snapshot_card_row(
+        [
+            _snapshot_card(aie_notes, 369, background=colors.HexColor("#FBFCFE"), padding=7),
+            _snapshot_card(ergo_notes, 369, background=colors.HexColor("#FBFCFE"), padding=7),
+        ],
+        [369, 369],
+    )
     return [header, Spacer(1, 6), kpis, Spacer(1, 5), charts, Spacer(1, 4), details, Spacer(1, 4), notes]
 
 
@@ -2058,8 +2312,10 @@ def render_combined_pdf_report(
     styles = getSampleStyleSheet()
     styles["Heading2"].fontSize = 16
     styles["Heading2"].leading = 17
+    styles["Heading2"].textColor = PDF_TEXT
     styles["BodyText"].fontSize = 7
     styles["BodyText"].leading = 9
+    styles["BodyText"].textColor = PDF_MUTED_TEXT
     styles.add(
         type(styles["BodyText"])(
             "Small",
@@ -2091,14 +2347,23 @@ def render_combined_pdf_report(
     for index, page in enumerate(pages):
         if index:
             story.append(PageBreak())
-        story.extend(page)
+        story.append(KeepTogether(page))
 
     def footer(canvas, document) -> None:
         canvas.saveState()
-        canvas.setFont("Helvetica", 6)
-        canvas.setFillColor(colors.HexColor("#64748B"))
-        canvas.drawString(24, 8, "AIE and Ergo Dashboard | Confidential aggregate report")
-        canvas.drawRightString(768, 8, f"Page {document.page}")
+        canvas.setFillColor(PDF_PAGE_BACKGROUND)
+        canvas.rect(0, 0, landscape(letter)[0], landscape(letter)[1], fill=1, stroke=0)
+        canvas.setStrokeColor(PDF_CARD_BORDER)
+        canvas.setLineWidth(0.5)
+        canvas.line(24, 15, 768, 15)
+        canvas.setFont("Helvetica", 5.5)
+        canvas.setFillColor(PDF_MUTED_TEXT)
+        canvas.drawString(
+            24,
+            6,
+            "Rates: rolling-12 cases x 200,000 / hours | DART: DAFW or restricted | All Ergo includes first aid",
+        )
+        canvas.drawRightString(768, 6, f"Page {document.page}")
         canvas.restoreState()
 
     doc.build(story, onFirstPage=footer, onLaterPages=footer)
@@ -2454,7 +2719,16 @@ def main() -> None:
             include_undated=True,
         )
         npi_metrics_filtered = apply_program_filter(npi_metrics_filtered, selected_programs)
-        npi_reds_filtered = apply_program_filter(npi_reds_df, selected_programs)
+        npi_reds_filtered = apply_factory_date_filter(
+            npi_reds_df,
+            selected_factories,
+            start_date,
+            end_date,
+            include_undated=True,
+        )
+        npi_reds_filtered = apply_program_filter(npi_reds_filtered, selected_programs)
+        npi_metrics_filtered = latest_npi_snapshots(npi_metrics_filtered)
+        npi_reds_filtered = latest_npi_snapshots(npi_reds_filtered)
 
         st.subheader("NPI Dashboard")
         if npi_metrics_filtered.empty and npi_reds_filtered.empty:
@@ -2469,6 +2743,16 @@ def main() -> None:
             has_hpu_data = has_eau_data and has_headcount_data
             has_complete_npi_data = has_eau_data and has_part_data and has_headcount_data and has_ergo_data
             summary = summarize_npi_dashboard(npi_metrics_filtered, npi_reds_filtered)
+            part_reduction_status = (
+                reduction_status(summary["current_part"], summary["future_part"])
+                if has_part_data
+                else "neutral"
+            )
+            headcount_reduction_status = (
+                reduction_status(summary["current_headcount"], summary["future_headcount"])
+                if has_headcount_data
+                else "neutral"
+            )
             program_names = available_npi_programs(npi_metrics_filtered, npi_reds_filtered)
             primary_title = program_names[0] if len(program_names) == 1 else f"{len(program_names)} NPI Programs"
             status_row = (
@@ -2521,8 +2805,8 @@ def main() -> None:
 
             card_cols = st.columns(4)
             card_cols[0].markdown(make_summary_card("Overall Progress", f"{summary['overall_progress']:.1f}/100" if has_complete_npi_data else unavailable, "Progress snapshot" if has_complete_npi_data else "Awaiting complete AIE and ergo data", "progress"), unsafe_allow_html=True)
-            card_cols[1].markdown(make_summary_card("Part Count Reduction", summary["part_change"] if has_part_data else unavailable, "Change vs current count" if has_part_data else "AIE data not available", "green"), unsafe_allow_html=True)
-            card_cols[2].markdown(make_summary_card("Hours Per Unit", summary["hpu_change"] if has_hpu_data else unavailable, f"Headcount {summary['headcount_change']}" if has_hpu_data else "AIE data not available", "green"), unsafe_allow_html=True)
+            card_cols[1].markdown(make_summary_card("Part Count Reduction", summary["part_change"] if has_part_data else unavailable, "Change vs current count" if has_part_data else "AIE data not available", part_reduction_status), unsafe_allow_html=True)
+            card_cols[2].markdown(make_summary_card("Headcount Reduction", summary["headcount_change"] if has_headcount_data else unavailable, "Change vs current headcount" if has_headcount_data else "AIE data not available", headcount_reduction_status), unsafe_allow_html=True)
             card_cols[3].markdown(make_summary_card("Open Ergo Reds", f"{summary['open_reds']}" if has_ergo_data else unavailable, "Open issues requiring action" if has_ergo_data else "Ergo data not available", "red"), unsafe_allow_html=True)
 
             upper_left, upper_right = st.columns(2)
@@ -2537,6 +2821,7 @@ def main() -> None:
                                 "Part Count Actual",
                                 "Part Count Reduction",
                                 "Part Count",
+                                future_color=REDUCTION_CHART_COLORS[part_reduction_status],
                             ),
                             width="stretch",
                         )
@@ -2554,7 +2839,7 @@ def main() -> None:
                                 "Headcount Reduction",
                                 "Headcount",
                                 current_color="#B5CAE3",
-                                future_color="#5B82B1",
+                                future_color=REDUCTION_CHART_COLORS[headcount_reduction_status],
                             ),
                             width="stretch",
                         )
