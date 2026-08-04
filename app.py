@@ -1311,6 +1311,26 @@ def format_change(current_value: float, future_value: float) -> str:
     return f"{((future_value - current_value) / current_value) * 100:+.1f}%"
 
 
+def injury_trend_status(
+    current_value: float,
+    prior_value: float,
+    has_comparison: bool = True,
+) -> str:
+    """Classify injury trends where a lower current value is favorable."""
+
+    if (
+        not has_comparison
+        or pd.isna(current_value)
+        or pd.isna(prior_value)
+    ):
+        return "neutral"
+    if current_value < prior_value:
+        return "green"
+    if current_value > prior_value:
+        return "red"
+    return "yellow"
+
+
 REDUCTION_CHART_COLORS = {
     "green": "#5E8F39",
     "red": "#D64545",
@@ -1505,6 +1525,9 @@ def summarize_production_dashboard(
             return 0.0
         return float(row[column])
 
+    def has_metric(row, column: str) -> bool:
+        return row is not None and pd.notna(row.get(column))
+
     current_recordable = metric(latest_prod, "Ergo Recordable Rate R12")
     current_dart = metric(latest_prod, "Ergo DART Rate R12")
     total_case_rate = metric(latest_prod, "Ergo All Rate R12")
@@ -1559,6 +1582,8 @@ def summarize_production_dashboard(
         "total_case_rate": total_case_rate,
         "prior_total_case_rate": prior_total_case_rate,
         "total_case_change": format_change(prior_total_case_rate, total_case_rate),
+        "has_total_case_comparison": has_metric(latest_prod, "Ergo All Rate R12")
+        and has_metric(prior_prod, "Ergo All Rate R12"),
         "current_dafw": current_dafw,
         "prior_dafw": prior_dafw,
         "dafw_change": format_change(prior_dafw, current_dafw),
@@ -1568,10 +1593,21 @@ def summarize_production_dashboard(
             prior_ehs_recordable,
             current_ehs_recordable,
         ),
+        "has_recordable_comparison": has_metric(
+            latest_prod, "Ergo Recordable Rate R12"
+        ) and has_metric(prior_prod, "Ergo Recordable Rate R12"),
+        "has_dart_comparison": has_metric(latest_prod, "Ergo DART Rate R12")
+        and has_metric(prior_prod, "Ergo DART Rate R12"),
+        "has_ehs_recordable_comparison": has_metric(
+            latest_prod, "EHS Recordable Rate R12"
+        ) and has_metric(prior_prod, "EHS Recordable Rate R12"),
         "current_ehs_dart": current_ehs_dart,
         "ergo_share": ergo_share,
         "prior_ergo_share": prior_ergo_share,
         "ergo_share_change": format_change(prior_ergo_share, ergo_share),
+        "has_ergo_share_comparison": has_metric(
+            latest_prod, "Ergo Share of EHS Recordables"
+        ) and has_metric(prior_prod, "Ergo Share of EHS Recordables"),
         "rolling_hours": rolling_hours,
         "ergo_all_cases_r12": metric(latest_prod, "Ergo All Cases R12"),
         "ergo_first_aid_r12": metric(latest_prod, "Ergo First Aid R12"),
@@ -2062,31 +2098,71 @@ def _snapshot_factory_kpi_items(
 ) -> list[tuple[str, str, str]]:
     """Build the factory PDF KPI row with prior-year comparisons."""
 
+    def comparison(change_key: str, available_key: str) -> str:
+        if not bool(summary.get(available_key, True)):
+            return "Prior-year data unavailable"
+        return f"{summary[change_key]} vs prior year"
+
     return [
         (
             "All Ergo Rate",
             f"{summary['total_case_rate']:.2f}",
-            f"{summary['total_case_change']} vs prior year",
+            comparison("total_case_change", "has_total_case_comparison"),
         ),
         (
             "Ergo Recordable",
             f"{summary['current_recordable']:.2f}",
-            f"{summary['recordable_change']} vs prior year",
+            comparison("recordable_change", "has_recordable_comparison"),
         ),
         (
             "Ergo DART",
             f"{summary['current_dart']:.2f}",
-            f"{summary['dart_change']} vs prior year",
+            comparison("dart_change", "has_dart_comparison"),
         ),
         (
             "EHS Recordable",
             f"{summary['current_ehs_recordable']:.2f}",
-            f"{summary['ehs_recordable_change']} vs prior year",
+            comparison(
+                "ehs_recordable_change",
+                "has_ehs_recordable_comparison",
+            ),
         ),
         (
             "Ergo % of EHS",
             f"{summary['ergo_share']:.1f}%",
-            f"{summary['ergo_share_change']} vs prior year",
+            comparison("ergo_share_change", "has_ergo_share_comparison"),
+        ),
+    ]
+
+
+def _snapshot_factory_kpi_statuses(summary: dict[str, object]) -> list[str]:
+    """Return status colors for the five factory PDF KPI cards."""
+
+    return [
+        injury_trend_status(
+            summary["total_case_rate"],
+            summary["prior_total_case_rate"],
+            bool(summary["has_total_case_comparison"]),
+        ),
+        injury_trend_status(
+            summary["current_recordable"],
+            summary["prior_recordable"],
+            bool(summary["has_recordable_comparison"]),
+        ),
+        injury_trend_status(
+            summary["current_dart"],
+            summary["prior_dart"],
+            bool(summary["has_dart_comparison"]),
+        ),
+        injury_trend_status(
+            summary["current_ehs_recordable"],
+            summary["prior_ehs_recordable"],
+            bool(summary["has_ehs_recordable_comparison"]),
+        ),
+        injury_trend_status(
+            summary["ergo_share"],
+            summary["prior_ergo_share"],
+            bool(summary["has_ergo_share_comparison"]),
         ),
     ]
 
@@ -2216,9 +2292,18 @@ def _factory_snapshot_page(
         f"Latest completed: {summary['latest_date'].strftime('%B %Y')}",
         styles,
     )
+    kpi_backgrounds = {
+        "green": PDF_GREEN,
+        "red": PDF_RED,
+        "yellow": PDF_YELLOW,
+        "neutral": PDF_NEUTRAL,
+    }
     kpis = _snapshot_kpis(
         _snapshot_factory_kpi_items(summary),
-        [PDF_NEUTRAL, PDF_RED, PDF_YELLOW, colors.HexColor("#E3EDF7"), PDF_GREEN],
+        [
+            kpi_backgrounds[status]
+            for status in _snapshot_factory_kpi_statuses(summary)
+        ],
     )
     trend = _snapshot_chart(
         make_production_trend_chart(

@@ -16,6 +16,7 @@ from app import (
     filter_injury_history,
     filter_through_end_month,
     has_npi_values,
+    injury_trend_status,
     latest_npi_snapshots,
     make_ergo_classification_chart,
     make_npi_detail_snapshot_chart,
@@ -28,6 +29,7 @@ from app import (
     _snapshot_operational_items,
     _snapshot_case_table_rows,
     _snapshot_factory_kpi_items,
+    _snapshot_factory_kpi_statuses,
 )
 from injury_metrics import aggregate_scope, build_monthly_detail, fiscal_year_start
 from sanitize_workbook import PII_HEADERS, clean_header
@@ -138,6 +140,34 @@ class InjuryMetricTests(unittest.TestCase):
         )
         self.assertNotIn("Hours", [item[0] for item in items])
         self.assertTrue(all("vs prior year" in item[2] for item in items))
+
+    def test_pdf_injury_kpi_colors_follow_trends(self) -> None:
+        self.assertEqual(injury_trend_status(2.0, 3.0), "green")
+        self.assertEqual(injury_trend_status(4.0, 3.0), "red")
+        self.assertEqual(injury_trend_status(3.0, 3.0), "yellow")
+        self.assertEqual(injury_trend_status(0.0, 0.0, False), "neutral")
+
+        summary = {
+            "total_case_rate": 2.0,
+            "prior_total_case_rate": 3.0,
+            "has_total_case_comparison": True,
+            "current_recordable": 4.0,
+            "prior_recordable": 3.0,
+            "has_recordable_comparison": True,
+            "current_dart": 3.0,
+            "prior_dart": 3.0,
+            "has_dart_comparison": True,
+            "current_ehs_recordable": 0.0,
+            "prior_ehs_recordable": 0.0,
+            "has_ehs_recordable_comparison": False,
+            "ergo_share": 1.0,
+            "prior_ergo_share": 2.0,
+            "has_ergo_share_comparison": True,
+        }
+        self.assertEqual(
+            _snapshot_factory_kpi_statuses(summary),
+            ["green", "red", "yellow", "neutral", "green"],
+        )
 
     def test_pdf_case_table_includes_rates_next_to_counts(self) -> None:
         summary = {
