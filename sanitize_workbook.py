@@ -65,7 +65,7 @@ def sanitize(source: Path, destination: Path) -> tuple[int, int]:
                 cell.column
                 for cell in workers_sheet[1]
                 if clean_header(cell.value).casefold()
-                in {"claim_status", "claim status"}
+                in {"claimstatus", "claim_status", "claim status"}
             ),
             None,
         )

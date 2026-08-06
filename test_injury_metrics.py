@@ -161,8 +161,6 @@ class InjuryMetricTests(unittest.TestCase):
             {
                 "closed_requests": 12,
                 "past_due_requests": 3,
-                "latest_year": 2026,
-                "current_workers_comp": 1234,
             }
         )
         self.assertEqual(
@@ -170,7 +168,6 @@ class InjuryMetricTests(unittest.TestCase):
             [
                 "Closed Medical Requests",
                 "Past-Due Medical Requests",
-                "2026 Workers Comp",
             ],
         )
         self.assertNotIn("Total Assessments", [item[0] for item in items])
@@ -356,7 +353,7 @@ class InjuryMetricTests(unittest.TestCase):
         claims = build_workers_comp_df(source)
         self.assertEqual(
             claims["Factory"].tolist(),
-            ["AP1", "AP4", "RPO", "BODE", "Other"],
+            ["AP1", "AP4", "Other"],
         )
         self.assertEqual(
             claims.columns.tolist(),
@@ -373,16 +370,61 @@ class InjuryMetricTests(unittest.TestCase):
         )
         self.assertEqual(
             claims["Claim Status"].tolist(),
-            ["Closed", "Open", "Incident", "Unknown", "Closed"],
+            ["Closed", "Open", "Closed"],
         )
         yearly = workers_comp_yearly_summary(claims)
-        self.assertEqual(int(yearly["Claims"].sum()), 5)
+        self.assertEqual(int(yearly["Claims"].sum()), 3)
         self.assertEqual(int(yearly["Closed Claims"].sum()), 2)
         self.assertEqual(int(yearly["Open Claims"].sum()), 1)
-        self.assertEqual(int(yearly["Incident Claims"].sum()), 1)
-        self.assertEqual(int(yearly["Unknown Status"].sum()), 1)
-        self.assertEqual(int(yearly["Known Status Claims"].sum()), 4)
-        self.assertEqual(float(yearly["Net Total Incurred"].sum()), 1500.0)
+        self.assertNotIn("Unknown Status", yearly)
+        self.assertNotIn("Incident Claims", yearly)
+        self.assertEqual(float(yearly["Net Total Incurred"].sum()), 800.0)
+
+    def test_latest_quarterly_workers_comp_format_excludes_record_only(self) -> None:
+        source = pd.DataFrame(
+            {
+                "ClaimNumberWc": ["A", "B", "C", "D", "E"],
+                "ClaimType": [
+                    "Medical Only",
+                    "Indemnity",
+                    "Record Only",
+                    "Medical Only",
+                    "Indemnity",
+                ],
+                "ClaimStatus": ["Closed", "Open", "Record Only", "Closed", "Open"],
+                "DateOfLoss": pd.to_datetime(
+                    ["2023-04-01", "2024-05-01", "2025-06-01", "2026-02-01", "2026-03-30"]
+                ),
+                "TotalIncurredNet": [100, 200, 300, 400, 500],
+                "NatureOfInjury": ["Strain"] * 5,
+                "AmendedCause": ["Lifting"] * 5,
+                "GroupedBodyPart": ["Back"] * 5,
+                "HierarchyLevel1": [
+                    "Appliance Park",
+                    "Appliance Park",
+                    "Roper",
+                    "Factory Service",
+                    "Remote - Salaried",
+                ],
+                "HierarchyLevel2": [
+                    "Appliance Park Hourly AP1",
+                    "Appliance Park Hourly Plastics COE",
+                    "Lafayette Roper Hourly",
+                    "Tech 109-23 Boston",
+                    "Other CA US Salaried",
+                ],
+            }
+        )
+
+        claims = build_workers_comp_df(source)
+
+        self.assertEqual(claims["Factory"].tolist(), ["AP1", "AP4", "BODE", "Other"])
+        self.assertEqual(claims["Claim Status"].tolist(), ["Closed", "Open", "Closed", "Open"])
+        self.assertEqual(float(claims["Amount"].sum()), 1200.0)
+        yearly = workers_comp_yearly_summary(claims)
+        self.assertEqual(int(yearly["Claims"].sum()), 4)
+        self.assertEqual(int(yearly["Closed Claims"].sum()), 2)
+        self.assertEqual(int(yearly["Open Claims"].sum()), 2)
 
     def test_injury_hotspots_prioritize_workstation_department_then_subsite(self) -> None:
         source = pd.DataFrame(

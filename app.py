@@ -456,30 +456,61 @@ def build_medical_requests_df(frame: pd.DataFrame) -> pd.DataFrame:
 def build_workers_comp_df(frame: pd.DataFrame) -> pd.DataFrame:
     structure_col = find_column(
         frame,
-        ["Structure_Name_at_3_Level_Above_Claim_Level", "Structure Name"],
+        [
+            "HierarchyLevel1",
+            "Structure_Name_at_3_Level_Above_Claim_Level",
+            "Structure Name",
+        ],
     )
-    unit_col = find_column(frame, ["Unit_Name", "Unit Name"])
-    file_col = find_column(frame, ["File_Number", "File Number"])
-    loss_date_col = find_column(frame, ["Date_of_Loss", "Date of Loss"])
+    unit_col = find_column(frame, ["HierarchyLevel2", "Unit_Name", "Unit Name"])
+    file_col = find_column(
+        frame,
+        ["ClaimNumberWc", "File_Number", "File Number"],
+    )
+    loss_date_col = find_column(
+        frame,
+        ["DateOfLoss", "Date_of_Loss", "Date of Loss"],
+    )
     incurred_col = find_column(
         frame,
-        ["Net_Total_Incurred", "Net Total Incurred"],
+        ["TotalIncurredNet", "Net_Total_Incurred", "Net Total Incurred"],
     )
     status_col = find_column(
         frame,
-        ["Claim_status", "Claim Status", "Claim_Status", "Status"],
+        ["ClaimStatus", "Claim_status", "Claim Status", "Claim_Status", "Status"],
+    )
+    claim_type_col = find_column(
+        frame,
+        ["ClaimType", "Claim Type", "Claim_Type"],
     )
     nature_col = find_column(
         frame,
-        ["Result_Nature_Description", "Result Nature Description", "Nature"],
+        [
+            "NatureOfInjury",
+            "Result_Nature_Description",
+            "Result Nature Description",
+            "Nature",
+        ],
     )
     cause_col = find_column(
         frame,
-        ["Cause_Code_Description", "Cause Code Description", "Cause"],
+        [
+            "AmendedCause",
+            "CauseDescription",
+            "Cause_Code_Description",
+            "Cause Code Description",
+            "Cause",
+        ],
     )
     body_part_col = find_column(
         frame,
-        ["Part_Target_Desc", "Part Target Desc", "Body Part"],
+        [
+            "GroupedBodyPart",
+            "BodyPart",
+            "Part_Target_Desc",
+            "Part Target Desc",
+            "Body Part",
+        ],
     )
     if all([structure_col, unit_col, file_col, loss_date_col, incurred_col]):
         source_columns = [
@@ -491,6 +522,8 @@ def build_workers_comp_df(frame: pd.DataFrame) -> pd.DataFrame:
         ]
         if status_col:
             source_columns.append(status_col)
+        if claim_type_col:
+            source_columns.append(claim_type_col)
         optional_detail_columns = [nature_col, cause_col, body_part_col]
         source_columns.extend(
             column for column in optional_detail_columns if column is not None
@@ -502,7 +535,9 @@ def build_workers_comp_df(frame: pd.DataFrame) -> pd.DataFrame:
             "File Number",
             "Date",
             "Amount",
-        ] + (["Claim Status"] if status_col else []) + [
+        ] + (["Claim Status"] if status_col else []) + (
+            ["Claim Type"] if claim_type_col else []
+        ) + [
             label
             for label, column in zip(
                 ["Claim Nature", "Claim Cause", "Body Part"],
@@ -514,6 +549,11 @@ def build_workers_comp_df(frame: pd.DataFrame) -> pd.DataFrame:
         detailed["Amount"] = coerce_numeric(detailed["Amount"]).fillna(0)
         detailed = detailed.dropna(subset=["Date", "File Number"])
         detailed = detailed.drop_duplicates(subset=["File Number"], keep="last")
+        if "Claim Type" in detailed:
+            claim_type = (
+                detailed["Claim Type"].fillna("").astype(str).str.strip().str.upper()
+            )
+            detailed = detailed[claim_type.ne("RECORD ONLY")].copy()
         detailed["Factory"] = [
             normalize_workers_comp_site(structure, unit)
             for structure, unit in zip(detailed["Structure"], detailed["Unit"])
@@ -528,11 +568,14 @@ def build_workers_comp_df(frame: pd.DataFrame) -> pd.DataFrame:
                     "CLOSED": "Closed",
                     "O": "Open",
                     "OPEN": "Open",
-                    "INCIDENT": "Incident",
                 }
-            ).fillna("Unknown")
+            )
+            detailed = detailed[
+                detailed["Claim Status"].isin({"Closed", "Open"})
+            ].copy()
         else:
-            detailed["Claim Status"] = "Unknown"
+            detailed["Claim Status"] = pd.Series(dtype="string")
+            detailed = detailed.iloc[0:0].copy()
         for column in ["Claim Nature", "Claim Cause", "Body Part"]:
             if column in detailed:
                 detailed[column] = detailed[column].map(_clean_focus_value)
@@ -1573,7 +1616,7 @@ def make_production_projects_chart(actual_points: float, goal_points: float, yea
 
 
 def workers_comp_yearly_summary(frame: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate unique ergonomic workers-comp claims by loss year and site."""
+    """Aggregate Open and Closed ergonomic claims by date-of-loss year and site."""
 
     if frame.empty:
         return pd.DataFrame(
@@ -1583,9 +1626,6 @@ def workers_comp_yearly_summary(frame: pd.DataFrame) -> pd.DataFrame:
                 "Claims",
                 "Closed Claims",
                 "Open Claims",
-                "Incident Claims",
-                "Unknown Status",
-                "Known Status Claims",
                 "Closed %",
                 "Net Total Incurred",
             ]
@@ -1599,15 +1639,10 @@ def workers_comp_yearly_summary(frame: pd.DataFrame) -> pd.DataFrame:
     )
     claim_counts = pd.to_numeric(claim_source, errors="coerce").fillna(0).astype(int)
     data["Claims"] = claim_counts
-    status = data.get("Claim Status", pd.Series("Unknown", index=data.index))
-    status = status.fillna("Unknown").astype(str)
+    status = data.get("Claim Status", pd.Series("", index=data.index))
+    status = status.fillna("").astype(str)
     data["Closed Claims"] = claim_counts.where(status.eq("Closed"), 0)
     data["Open Claims"] = claim_counts.where(status.eq("Open"), 0)
-    data["Incident Claims"] = claim_counts.where(status.eq("Incident"), 0)
-    data["Unknown Status"] = claim_counts.where(
-        ~status.isin(["Closed", "Open", "Incident"]),
-        0,
-    )
     yearly = (
         data.groupby(["Year", "Factory"], as_index=False)
         .agg(
@@ -1615,24 +1650,32 @@ def workers_comp_yearly_summary(frame: pd.DataFrame) -> pd.DataFrame:
             **{
                 "Closed Claims": ("Closed Claims", "sum"),
                 "Open Claims": ("Open Claims", "sum"),
-                "Incident Claims": ("Incident Claims", "sum"),
-                "Unknown Status": ("Unknown Status", "sum"),
             },
             **{"Net Total Incurred": ("Amount", "sum")},
         )
         .sort_values(["Year", "Factory"])
     )
-    yearly["Known Status Claims"] = (
-        yearly["Closed Claims"]
-        + yearly["Open Claims"]
-        + yearly["Incident Claims"]
-    )
     yearly["Closed %"] = (
         yearly["Closed Claims"]
-        .div(yearly["Known Status Claims"].where(yearly["Known Status Claims"] > 0))
+        .div(yearly["Claims"].where(yearly["Claims"] > 0))
         .mul(100)
     )
     return yearly
+
+
+def workers_comp_date_note(frame: pd.DataFrame) -> str:
+    """Describe the date-of-loss coverage of the current quarterly extract."""
+
+    if frame.empty or "Date" not in frame:
+        return "Latest quarterly extract; claims are grouped by date-of-loss year."
+    dates = pd.to_datetime(frame["Date"], errors="coerce").dropna()
+    if dates.empty:
+        return "Latest quarterly extract; claims are grouped by date-of-loss year."
+    return (
+        "Latest quarterly extract; loss dates in this view: "
+        f"{dates.min().strftime('%b %d, %Y')} through "
+        f"{dates.max().strftime('%b %d, %Y')}."
+    )
 
 
 def make_workers_comp_yearly_chart(frame: pd.DataFrame) -> go.Figure:
@@ -1646,15 +1689,13 @@ def make_workers_comp_yearly_chart(frame: pd.DataFrame) -> go.Figure:
     annual_status = yearly.groupby("Year", as_index=False).agg(
         **{
             "Closed Claims": ("Closed Claims", "sum"),
-            "Known Status Claims": ("Known Status Claims", "sum"),
+            "Claims": ("Claims", "sum"),
         }
     )
     annual_status["Closed %"] = (
         annual_status["Closed Claims"]
         .div(
-            annual_status["Known Status Claims"].where(
-                annual_status["Known Status Claims"] > 0
-            )
+            annual_status["Claims"].where(annual_status["Claims"] > 0)
         )
         .mul(100)
     )
@@ -1693,8 +1734,6 @@ def make_workers_comp_yearly_chart(frame: pd.DataFrame) -> go.Figure:
             "Claims",
             "Closed Claims",
             "Open Claims",
-            "Incident Claims",
-            "Unknown Status",
             "Closed Label",
         ],
         color_discrete_map=site_colors,
@@ -1708,12 +1747,14 @@ def make_workers_comp_yearly_chart(frame: pd.DataFrame) -> go.Figure:
             "Site: %{fullData.name}<br>Loss year: %{x}<br>"
             "Net incurred: $%{y:,.0f}<br>Claims: %{customdata[0]}<br>"
             "Closed: %{customdata[1]}<br>Open: %{customdata[2]}<br>"
-            "Incident: %{customdata[3]}<br>Unknown: %{customdata[4]}<br>"
-            "Closed rate: %{customdata[5]}<extra></extra>"
+            "Closed rate: %{customdata[3]}<extra></extra>"
         ),
     )
     fig.update_layout(
-        title="Ergonomic Workers' Compensation Yearly Trends",
+        title=(
+            "Ergonomic Workers' Compensation Yearly Trends"
+            f"<br><sup>{workers_comp_date_note(frame)}</sup>"
+        ),
         height=410,
         margin=dict(l=92, r=16, t=48, b=100),
         legend=below_chart_legend(),
@@ -2729,11 +2770,6 @@ def _snapshot_operational_items(
             f"{summary['past_due_requests']:,}",
             "Selected period",
         ),
-        (
-            f"{summary['latest_year']} Workers Comp",
-            f"${summary['current_workers_comp']:,.0f}",
-            "Net incurred",
-        ),
     ]
 
 
@@ -2997,7 +3033,7 @@ def _factory_snapshot_page(
     )
     operational_strip = _snapshot_kpis(
         _snapshot_operational_items(summary),
-        [PDF_GREEN, PDF_RED, colors.HexColor("#E3EDF7")],
+        [PDF_GREEN, PDF_RED],
     )
     return [
         header,
@@ -3017,7 +3053,8 @@ def _workers_comp_snapshot_page(
     styles: dict,
 ) -> list[object]:
     workers = data.get("workers_comp", pd.DataFrame()).copy()
-    yearly = workers_comp_yearly_summary(workers)
+    ge_workers = apply_workers_comp_scope_filter(workers, "GE Appliances")
+    yearly = workers_comp_yearly_summary(ge_workers)
     if yearly.empty or int(yearly["Claims"].sum()) == 0:
         return []
 
@@ -3028,9 +3065,6 @@ def _workers_comp_snapshot_page(
             **{
                 "Closed Claims": ("Closed Claims", "sum"),
                 "Open Claims": ("Open Claims", "sum"),
-                "Incident Claims": ("Incident Claims", "sum"),
-                "Unknown Status": ("Unknown Status", "sum"),
-                "Known Status Claims": ("Known Status Claims", "sum"),
                 "Net Total Incurred": ("Net Total Incurred", "sum"),
             },
         )
@@ -3038,19 +3072,21 @@ def _workers_comp_snapshot_page(
     )
     annual["Closed %"] = (
         annual["Closed Claims"]
-        .div(annual["Known Status Claims"].where(annual["Known Status Claims"] > 0))
+        .div(annual["Claims"].where(annual["Claims"] > 0))
         .mul(100)
     )
     annual["Average per Claim"] = annual["Net Total Incurred"].div(
         annual["Claims"].where(annual["Claims"] > 0)
     )
+    major_site_yearly = workers_comp_yearly_summary(
+        workers[workers["Factory"].ne("Other")]
+    )
     by_site = (
-        yearly.groupby("Factory", as_index=False)
+        major_site_yearly.groupby("Factory", as_index=False)
         .agg(
             Claims=("Claims", "sum"),
             **{
                 "Closed Claims": ("Closed Claims", "sum"),
-                "Known Status Claims": ("Known Status Claims", "sum"),
                 "Net Total Incurred": ("Net Total Incurred", "sum"),
             },
         )
@@ -3058,7 +3094,7 @@ def _workers_comp_snapshot_page(
     )
     by_site["Closed %"] = (
         by_site["Closed Claims"]
-        .div(by_site["Known Status Claims"].where(by_site["Known Status Claims"] > 0))
+        .div(by_site["Claims"].where(by_site["Claims"] > 0))
         .mul(100)
     )
     by_site["Average per Claim"] = by_site["Net Total Incurred"].div(
@@ -3069,8 +3105,9 @@ def _workers_comp_snapshot_page(
     latest_year = int(latest["Year"])
     header = _snapshot_header(
         "Ergonomic Workers' Compensation Trends",
-        "All Sites — Based on Date of Loss",
+        "GE Appliances — Based on Date of Loss",
         f"<b>Loss years</b><br/>{first_year} - {latest_year}<br/>"
+        f"{workers_comp_date_note(ge_workers)}<br/>"
         f"Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}",
         styles,
     )
@@ -3084,7 +3121,7 @@ def _workers_comp_snapshot_page(
         [PDF_NEUTRAL, colors.HexColor("#E3EDF7"), PDF_NEUTRAL, colors.HexColor("#E3EDF7")],
     )
     chart = _snapshot_chart(
-        make_workers_comp_yearly_chart(workers),
+        make_workers_comp_yearly_chart(ge_workers),
         730,
         225,
         1400,
@@ -3092,7 +3129,7 @@ def _workers_comp_snapshot_page(
     )
     chart_card = _snapshot_card(chart, 744)
     annual_rows: list[list[object]] = [
-        ["Loss Year", "Claims", "Closed", "Closed %", "Net Incurred"]
+        ["Loss Year", "Claims", "Closed", "Open", "Closed %", "Net Incurred"]
     ]
     for row in annual.to_dict("records"):
         annual_rows.append(
@@ -3100,12 +3137,13 @@ def _workers_comp_snapshot_page(
                 str(int(row["Year"])),
                 f"{int(row['Claims']):,}",
                 f"{int(row['Closed Claims']):,}",
+                f"{int(row['Open Claims']):,}",
                 f"{row['Closed %']:.1f}%" if pd.notna(row["Closed %"]) else "N/A",
                 f"${row['Net Total Incurred']:,.0f}",
             ]
         )
     site_rows: list[list[object]] = [
-        ["Site", "Claims", "Closed", "Closed %", "Net Incurred"]
+        ["Site", "Claims", "Closed", "Open", "Closed %", "Net Incurred"]
     ]
     for row in by_site.to_dict("records"):
         site_rows.append(
@@ -3113,6 +3151,7 @@ def _workers_comp_snapshot_page(
                 str(row["Factory"]),
                 f"{int(row['Claims']):,}",
                 f"{int(row['Closed Claims']):,}",
+                f"{int(row['Claims'] - row['Closed Claims']):,}",
                 f"{row['Closed %']:.1f}%" if pd.notna(row["Closed %"]) else "N/A",
                 f"${row['Net Total Incurred']:,.0f}",
             ]
@@ -3120,11 +3159,11 @@ def _workers_comp_snapshot_page(
     tables = _snapshot_card_row(
         [
             _snapshot_card(
-                _snapshot_table(annual_rows, [56, 45, 45, 61, 105], font_size=6.2),
+                _snapshot_table(annual_rows, [50, 37, 37, 37, 53, 98], font_size=6.2),
                 366,
             ),
             _snapshot_card(
-                _snapshot_table(site_rows, [56, 45, 45, 61, 105], font_size=6.2),
+                _snapshot_table(site_rows, [50, 37, 37, 37, 53, 98], font_size=6.2),
                 366,
             ),
         ],
@@ -3655,7 +3694,7 @@ def main() -> None:
             end_date,
         )
         recent_workers_comp_focus = apply_recent_focus_filter(
-            workers_comp_df,
+            apply_workers_comp_scope_filter(workers_comp_df, selected_scope),
             selected_scope,
             end_date,
         )
@@ -3725,11 +3764,6 @@ def main() -> None:
                     {"Metric": "Ergo Recordables / EHS Recordables", "Current": f"{summary['ergo_share']:.1f}%", "Prior year": "—", "Change": "—"},
                 ]
             )
-            workers_table = summary["workers_by_year"].copy()
-            if not workers_table.empty:
-                workers_table["Paid Out"] = workers_table["Amount"].map(lambda value: f"$ {value:,.0f}")
-                workers_table = workers_table[["Year", "Paid Out"]]
-
             top_left, top_right = st.columns([2.4, 1.0])
             with top_left:
                 with st.container(border=True):
@@ -3938,7 +3972,7 @@ def main() -> None:
                     if claim_cause_focus.empty and claim_body_focus.empty:
                         st.caption("No workers’ comp driver data is available for this scope.")
 
-            medical_column, injury_column, workers_column = st.columns([1.0, 1.35, 1.0])
+            medical_column, injury_column = st.columns([1.0, 1.35])
             with medical_column:
                 with st.container(border=True):
                     st.markdown("**Medical Requests**")
@@ -3947,15 +3981,6 @@ def main() -> None:
                 with st.container(border=True):
                     st.markdown("**Injury Trend Analysis**")
                     st.dataframe(injury_table, width="stretch", hide_index=True)
-            with workers_column:
-                with st.container(border=True):
-                    st.markdown("**Workers Compensation Ergo Claims Net Incurred (YTD)**")
-                    if not workers_table.empty:
-                        st.dataframe(workers_table, width="stretch", hide_index=True)
-                        if summary["prior_workers_comp"]:
-                            st.caption(f"Change vs prior year: {summary['workers_change']:+.1f}%")
-                    else:
-                        st.caption("No workers compensation data is available for the selected filters.")
             workers_comp_scope = apply_workers_comp_scope_filter(
                 workers_comp_df,
                 selected_scope,
@@ -3968,10 +3993,10 @@ def main() -> None:
                         f"— {selected_scope}**"
                     )
                     st.caption(
-                        "Loss year is based on Date_of_Loss. Bar labels show unique claim counts; "
-                        "the x-axis shows the percent closed among claims with a known status. "
-                        "Incident is treated as known but not closed; blank/N/A statuses are excluded. "
-                        "Cost is Net_Total_Incurred. "
+                        f"{workers_comp_date_note(workers_comp_scope)} "
+                        "Bar labels show unique Open and Closed claim counts; the x-axis shows "
+                        "Closed / (Closed + Open). Record Only claims are excluded. "
+                        "Cost is TotalIncurredNet. "
                         "Claimant names and claim details are not retained or displayed."
                     )
                     st.plotly_chart(
@@ -3986,9 +4011,6 @@ def main() -> None:
                             **{
                                 "Closed Claims": ("Closed Claims", "sum"),
                                 "Open Claims": ("Open Claims", "sum"),
-                                "Incident Claims": ("Incident Claims", "sum"),
-                                "Unknown Status": ("Unknown Status", "sum"),
-                                "Known Status Claims": ("Known Status Claims", "sum"),
                                 "Net Total Incurred": (
                                     "Net Total Incurred",
                                     "sum",
@@ -4000,8 +4022,8 @@ def main() -> None:
                     annual_workers["Closed %"] = (
                         annual_workers["Closed Claims"]
                         .div(
-                            annual_workers["Known Status Claims"].where(
-                                annual_workers["Known Status Claims"] > 0
+                            annual_workers["Claims"].where(
+                                annual_workers["Claims"] > 0
                             )
                         )
                         .mul(100)
@@ -4013,8 +4035,6 @@ def main() -> None:
                             "Claims",
                             "Closed Claims",
                             "Open Claims",
-                            "Incident Claims",
-                            "Unknown Status",
                             "Closed %",
                             "Net Total Incurred",
                         ]
