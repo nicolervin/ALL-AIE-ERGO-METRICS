@@ -223,7 +223,10 @@ def build_ergo_monthly(frame: pd.DataFrame) -> pd.DataFrame:
     data["Case Date"] = pd.to_datetime(data["Case Date"], errors="coerce")
     data["Factory"] = data["Site"].map(lambda value: normalize_site(value, raw_site=True))
     data = data.dropna(subset=["System Case ID", "Case Date"])
-    data = data.drop_duplicates(subset=["System Case ID"], keep="last")
+    data = data.drop_duplicates(
+        subset=["Factory", "System Case ID"],
+        keep="last",
+    )
 
     data["Ergo Recordable"] = (
         data["U.S. OSHA Recordable?"].astype(str).str.strip().str.lower().eq("yes")
@@ -282,7 +285,7 @@ def available_scopes(detail: pd.DataFrame) -> list[str]:
     sites = sorted(
         site
         for site in detail["Factory"].dropna().astype(str).unique()
-        if site not in {"GEA"}
+        if site not in {"GEA", "Other"}
     )
     return preferred + sites
 
@@ -290,9 +293,12 @@ def available_scopes(detail: pd.DataFrame) -> list[str]:
 def aggregate_scope(detail: pd.DataFrame, scope: str) -> pd.DataFrame:
     data = detail.copy()
     if scope == "GE Appliances":
-        data = data[data["Factory"] != "GEA"]
+        # Corporate rates must keep the numerator and denominator on the same
+        # population. "Other" has injury cases but no matching EHS hours in
+        # the supplied workbook, so including it would inflate every rate.
+        data = data[~data["Factory"].isin({"GEA", "Other"})]
     elif scope == "Supply Chain":
-        data = data[~data["Factory"].isin({"GEA", "BODE"})]
+        data = data[~data["Factory"].isin({"GEA", "BODE", "Other"})]
     else:
         data = data[data["Factory"] == scope]
 

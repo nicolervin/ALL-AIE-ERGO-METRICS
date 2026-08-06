@@ -32,8 +32,10 @@ def clean_header(value: object) -> str:
 
 
 def sanitize(source: Path, destination: Path) -> tuple[int, int]:
+    cached_workbook = load_workbook(source, data_only=True, read_only=True)
     workbook = load_workbook(source)
     if "Ergo_Injuries" not in workbook.sheetnames:
+        cached_workbook.close()
         raise ValueError("The workbook does not contain Ergo_Injuries.")
 
     sheet = workbook["Ergo_Injuries"]
@@ -44,7 +46,45 @@ def sanitize(source: Path, destination: Path) -> tuple[int, int]:
     }
     missing = PII_HEADERS - set(columns.values())
     if missing:
+        cached_workbook.close()
         raise ValueError(f"Expected PII columns were not found: {', '.join(sorted(missing))}")
+
+    workers_sheet_name = next(
+        (
+            name
+            for name in workbook.sheetnames
+            if clean_header(name).casefold() == "workers_comp_ergo"
+        ),
+        None,
+    )
+    if workers_sheet_name is not None:
+        workers_sheet = workbook[workers_sheet_name]
+        cached_workers_sheet = cached_workbook[workers_sheet_name]
+        status_column = next(
+            (
+                cell.column
+                for cell in workers_sheet[1]
+                if clean_header(cell.value).casefold()
+                in {"claim_status", "claim status"}
+            ),
+            None,
+        )
+        if status_column is not None:
+            cached_status_values = cached_workers_sheet.iter_rows(
+                min_row=2,
+                min_col=status_column,
+                max_col=status_column,
+                values_only=True,
+            )
+            for row_index, (cached_value,) in enumerate(
+                cached_status_values,
+                start=2,
+            ):
+                workers_sheet.cell(
+                    row=row_index,
+                    column=status_column,
+                ).value = cached_value
+    cached_workbook.close()
 
     cleared = 0
     for column_index in columns:

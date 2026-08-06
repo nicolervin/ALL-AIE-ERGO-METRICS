@@ -37,7 +37,7 @@ SHEET_ALIASES = {
     "risk_projects": ["risk_projects", "Ergo_Assessments_Risk_Reduction"],
     "risk_reduction_goals": ["risk_reduction_goals", "Ergo_Risk_Reduction"],
     "medical_requests": ["medical_requests", "Medical_Requests"],
-    "workers_comp": ["workers_comp", "Ergo_Workers_Comp"],
+    "workers_comp": ["workers_comp", "workers_comp_ergo", "Ergo_Workers_Comp"],
     "dashboard_goals": ["dashboard_goals", "Dashboard_Goals"],
     "npi_metrics": ["npi_metrics", "NPI_AIE", "AIE_NPI"],
     "npi_ergo_reds": ["npi_ergo_reds", "NPI_Ergo", "Ergo_NPI"],
@@ -97,6 +97,12 @@ def load_workbook_data(file_bytes: bytes | None, file_name: str | None = None) -
                 "Site",
                 "System Case ID",
                 "Case Date",
+                "Workstation",
+                "Employee Dept",
+                "Sub-Department",
+                "SubSite",
+                "Body Part",
+                "Job Factor",
                 "U.S. OSHA Recordable?",
                 "Inj. DAFW?",
                 "Inj. RWA?",
@@ -115,6 +121,7 @@ def load_workbook_data(file_bytes: bytes | None, file_name: str | None = None) -
             detail, latest_complete_month = build_monthly_detail(ehs_frame, ergo_frame)
             detail.attrs["latest_complete_month"] = latest_complete_month
             normalized["production_injuries"] = detail
+            normalized["injury_hotspots"] = build_injury_hotspots_df(ergo_frame)
         except Exception as exc:
             errors.append(f"Unable to build injury metrics: {exc}")
 
@@ -168,6 +175,120 @@ def find_column(frame: pd.DataFrame, candidates: list[str]) -> str | None:
         if str(name).strip().lower() in lowered:
             return lowered[str(name).strip().lower()]
     return None
+
+
+def _clean_focus_value(value: object) -> str:
+    """Normalize optional categorical fields used in injury focus summaries."""
+
+    text = re.sub(r"\s+", " ", str(value).strip())
+    if text.casefold() in {
+        "",
+        "nan",
+        "none",
+        "n/a",
+        "na",
+        "unknown",
+        "[not defined]",
+        "not defined",
+    }:
+        return ""
+    return text
+
+
+def build_injury_hotspots_df(frame: pd.DataFrame) -> pd.DataFrame:
+    """Retain non-PII fields needed to identify recent ergonomic hotspots."""
+
+    site_col = find_column(frame, ["Site", "Factory"])
+    date_col = find_column(frame, ["Case Date", "Date"])
+    if not site_col or not date_col:
+        return pd.DataFrame(
+            columns=[
+                "Factory",
+                "Date",
+                "Work Area",
+                "Work Area Source",
+                "Body Part",
+                "Job Factor",
+                "Injury Count",
+            ]
+        )
+    workstation_col = find_column(frame, ["Workstation", "Work Station"])
+    employee_department_col = find_column(
+        frame,
+        ["Employee Dept", "Employee Department"],
+    )
+    sub_department_col = find_column(
+        frame,
+        ["Sub-Department", "Sub Department"],
+    )
+    subsite_col = find_column(frame, ["SubSite", "Sub Site", "Work Area"])
+    body_part_col = find_column(frame, ["Body Part", "Body_Part"])
+    job_factor_col = find_column(frame, ["Job Factor", "Job_Factor"])
+
+    result = pd.DataFrame(
+        {
+            "Factory": frame[site_col].map(lambda value: normalize_site(value, raw_site=True)),
+            "Date": pd.to_datetime(frame[date_col], errors="coerce"),
+            "Workstation": (
+                frame[workstation_col].map(_clean_focus_value)
+                if workstation_col
+                else pd.Series("", index=frame.index)
+            ),
+            "Sub-Department": (
+                frame[sub_department_col].map(_clean_focus_value)
+                if sub_department_col
+                else pd.Series("", index=frame.index)
+            ),
+            "Department": (
+                frame[employee_department_col].map(_clean_focus_value)
+                if employee_department_col
+                else pd.Series("", index=frame.index)
+            ),
+            "SubSite": (
+                frame[subsite_col].map(_clean_focus_value)
+                if subsite_col
+                else pd.Series("", index=frame.index)
+            ),
+            "Body Part": (
+                frame[body_part_col].map(_clean_focus_value)
+                if body_part_col
+                else pd.Series("", index=frame.index)
+            ),
+            "Job Factor": (
+                frame[job_factor_col].map(_clean_focus_value)
+                if job_factor_col
+                else pd.Series("", index=frame.index)
+            ),
+        },
+        index=frame.index,
+    )
+    has_workstation = result["Workstation"].ne("")
+    has_sub_department = result["Sub-Department"].ne("")
+    has_department = result["Department"].ne("")
+    result["Work Area"] = result["Workstation"].where(
+        has_workstation,
+        result["Sub-Department"].where(
+            has_sub_department,
+            result["Department"].where(has_department, result["SubSite"]),
+        ),
+    )
+    result["Work Area Source"] = "SubSite"
+    result.loc[has_department, "Work Area Source"] = "Department"
+    result.loc[has_sub_department, "Work Area Source"] = "Sub-Department"
+    result.loc[has_workstation, "Work Area Source"] = "Workstation"
+    result.loc[result["Work Area"].eq(""), "Work Area Source"] = ""
+    result["Injury Count"] = 1
+    return result[
+        [
+            "Factory",
+            "Date",
+            "Work Area",
+            "Work Area Source",
+            "Body Part",
+            "Job Factor",
+            "Injury Count",
+        ]
+    ].dropna(subset=["Date"]).reset_index(drop=True)
 
 
 def coerce_numeric(series: pd.Series) -> pd.Series:
@@ -253,16 +374,21 @@ def build_assessment_df(frame: pd.DataFrame) -> pd.DataFrame:
         dates = year_month_date(frame, year_col, month_col)
     else:
         dates = pd.Series(pd.NaT, index=frame.index)
-    df["Critical"] = pd.to_numeric(df["Critical"], errors="coerce").fillna(0)
-    df["Red"] = pd.to_numeric(df["Red"], errors="coerce").fillna(0)
-    df["Yellow"] = pd.to_numeric(df["Yellow"], errors="coerce").fillna(0)
-    df["Green"] = pd.to_numeric(df["Green"], errors="coerce").fillna(0)
+    df["Date"] = dates
+    risk_columns = ["Critical", "Red", "Yellow", "Green"]
+    for column in risk_columns:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+    df["_row_order"] = range(len(df))
+    df = df.sort_values(["Factory", "Date", "_row_order"])
+    df[risk_columns] = df.groupby("Factory", sort=False)[risk_columns].ffill()
+    df[risk_columns] = df[risk_columns].fillna(0)
+    df = df.sort_values("_row_order")
     rows = []
     for _, row in df.iterrows():
-        rows.append({"Factory": row["Factory"], "Date": dates.loc[_], "Risk Level": "Critical", "Count": int(row["Critical"])})
-        rows.append({"Factory": row["Factory"], "Date": dates.loc[_], "Risk Level": "Red", "Count": int(row["Red"])})
-        rows.append({"Factory": row["Factory"], "Date": dates.loc[_], "Risk Level": "Yellow", "Count": int(row["Yellow"])})
-        rows.append({"Factory": row["Factory"], "Date": dates.loc[_], "Risk Level": "Green", "Count": int(row["Green"])})
+        rows.append({"Factory": row["Factory"], "Date": row["Date"], "Risk Level": "Critical", "Count": int(row["Critical"])})
+        rows.append({"Factory": row["Factory"], "Date": row["Date"], "Risk Level": "Red", "Count": int(row["Red"])})
+        rows.append({"Factory": row["Factory"], "Date": row["Date"], "Risk Level": "Yellow", "Count": int(row["Yellow"])})
+        rows.append({"Factory": row["Factory"], "Date": row["Date"], "Risk Level": "Green", "Count": int(row["Green"])})
     return pd.DataFrame(rows)
 
 
@@ -328,6 +454,104 @@ def build_medical_requests_df(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_workers_comp_df(frame: pd.DataFrame) -> pd.DataFrame:
+    structure_col = find_column(
+        frame,
+        ["Structure_Name_at_3_Level_Above_Claim_Level", "Structure Name"],
+    )
+    unit_col = find_column(frame, ["Unit_Name", "Unit Name"])
+    file_col = find_column(frame, ["File_Number", "File Number"])
+    loss_date_col = find_column(frame, ["Date_of_Loss", "Date of Loss"])
+    incurred_col = find_column(
+        frame,
+        ["Net_Total_Incurred", "Net Total Incurred"],
+    )
+    status_col = find_column(
+        frame,
+        ["Claim_status", "Claim Status", "Claim_Status", "Status"],
+    )
+    nature_col = find_column(
+        frame,
+        ["Result_Nature_Description", "Result Nature Description", "Nature"],
+    )
+    cause_col = find_column(
+        frame,
+        ["Cause_Code_Description", "Cause Code Description", "Cause"],
+    )
+    body_part_col = find_column(
+        frame,
+        ["Part_Target_Desc", "Part Target Desc", "Body Part"],
+    )
+    if all([structure_col, unit_col, file_col, loss_date_col, incurred_col]):
+        source_columns = [
+            structure_col,
+            unit_col,
+            file_col,
+            loss_date_col,
+            incurred_col,
+        ]
+        if status_col:
+            source_columns.append(status_col)
+        optional_detail_columns = [nature_col, cause_col, body_part_col]
+        source_columns.extend(
+            column for column in optional_detail_columns if column is not None
+        )
+        detailed = frame[source_columns].copy()
+        detailed.columns = [
+            "Structure",
+            "Unit",
+            "File Number",
+            "Date",
+            "Amount",
+        ] + (["Claim Status"] if status_col else []) + [
+            label
+            for label, column in zip(
+                ["Claim Nature", "Claim Cause", "Body Part"],
+                optional_detail_columns,
+            )
+            if column is not None
+        ]
+        detailed["Date"] = pd.to_datetime(detailed["Date"], errors="coerce")
+        detailed["Amount"] = coerce_numeric(detailed["Amount"]).fillna(0)
+        detailed = detailed.dropna(subset=["Date", "File Number"])
+        detailed = detailed.drop_duplicates(subset=["File Number"], keep="last")
+        detailed["Factory"] = [
+            normalize_workers_comp_site(structure, unit)
+            for structure, unit in zip(detailed["Structure"], detailed["Unit"])
+        ]
+        if "Claim Status" in detailed:
+            normalized_status = (
+                detailed["Claim Status"].fillna("").astype(str).str.strip().str.upper()
+            )
+            detailed["Claim Status"] = normalized_status.map(
+                {
+                    "C": "Closed",
+                    "CLOSED": "Closed",
+                    "O": "Open",
+                    "OPEN": "Open",
+                    "INCIDENT": "Incident",
+                }
+            ).fillna("Unknown")
+        else:
+            detailed["Claim Status"] = "Unknown"
+        for column in ["Claim Nature", "Claim Cause", "Body Part"]:
+            if column in detailed:
+                detailed[column] = detailed[column].map(_clean_focus_value)
+            else:
+                detailed[column] = ""
+        detailed["Claim Count"] = 1
+        return detailed[
+            [
+                "Factory",
+                "Date",
+                "Amount",
+                "Claim Count",
+                "Claim Status",
+                "Claim Nature",
+                "Claim Cause",
+                "Body Part",
+            ]
+        ].reset_index(drop=True)
+
     factory_col = find_column(frame, ["Site", "Factory"])
     year_col = find_column(frame, ["Year"])
     month_col = find_column(frame, ["Month"])
@@ -339,7 +563,48 @@ def build_workers_comp_df(frame: pd.DataFrame) -> pd.DataFrame:
     df["Factory"] = df["Factory"].map(normalize_site)
     df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce").fillna(0)
     df["Date"] = year_month_date(df, "Year", "Month")
-    return df[["Factory", "Date", "Amount"]]
+    df["Claim Count"] = 0
+    df["Claim Status"] = "Unknown"
+    df["Claim Nature"] = ""
+    df["Claim Cause"] = ""
+    df["Body Part"] = ""
+    return df[
+        [
+            "Factory",
+            "Date",
+            "Amount",
+            "Claim Count",
+            "Claim Status",
+            "Claim Nature",
+            "Claim Cause",
+            "Body Part",
+        ]
+    ]
+
+
+def normalize_workers_comp_site(structure: object, unit: object) -> str:
+    """Map detailed workers-comp Structure/Unit values to dashboard site codes."""
+
+    structure_name = re.sub(r"\s+", " ", str(structure).strip()).upper()
+    unit_name = re.sub(r"\s+", " ", str(unit).strip()).upper()
+    if (
+        "FACTORY SERVICE" in structure_name
+        or "FACTORY SERVICE" in unit_name
+        or structure_name in {"BOD", "BODE", "BODEWELL", "FS"}
+    ):
+        return "BODE"
+    ap_match = re.search(r"\bAP\s*([1-5])\b", unit_name)
+    if ap_match:
+        return f"AP{ap_match.group(1)}"
+    if structure_name == "APPLIANCE PARK" and "PLASTICS COE" in unit_name:
+        return "AP4"
+    structure_sites = {
+        "ROPER": "RPO",
+        "DECATUR": "DPO",
+        "MONOGRAM": "MRO",
+        "CAMDEN": "CPO",
+    }
+    return structure_sites.get(structure_name, "Other")
 
 
 def build_dashboard_goals_df(frame: pd.DataFrame) -> pd.DataFrame:
@@ -555,6 +820,207 @@ def apply_scope_ytd_filter(
     )
 
 
+def apply_workers_comp_scope_filter(
+    frame: pd.DataFrame,
+    scope: str,
+) -> pd.DataFrame:
+    """Filter workers' compensation claims to the selected reporting scope.
+
+    Aggregate scopes are relabeled so their yearly chart is one combined series
+    instead of separate site bars.
+    """
+
+    if frame.empty:
+        return frame
+    result = frame.copy()
+    if "Factory" not in result:
+        return result
+    if scope == "GE Appliances":
+        result["Factory"] = "GE Appliances"
+    elif scope == "Supply Chain":
+        result = result[~result["Factory"].isin({"BODE", "Other"})].copy()
+        result["Factory"] = "Supply Chain"
+    else:
+        result = result[result["Factory"] == scope].copy()
+    return result
+
+
+def apply_workers_comp_ytd_filter(
+    frame: pd.DataFrame,
+    scope: str,
+    end_date: pd.Timestamp | None,
+) -> pd.DataFrame:
+    """Filter workers' compensation claims by scope and reporting-year YTD."""
+
+    result = apply_workers_comp_scope_filter(frame, scope)
+    if result.empty or end_date is None or "Date" not in result:
+        return result
+    reporting_end = pd.Timestamp(end_date).to_period("M").end_time.normalize()
+    reporting_start = pd.Timestamp(year=reporting_end.year, month=1, day=1)
+    dates = pd.to_datetime(result["Date"], errors="coerce")
+    return result[(dates >= reporting_start) & (dates <= reporting_end)]
+
+
+def apply_recent_focus_filter(
+    frame: pd.DataFrame,
+    scope: str,
+    end_date: pd.Timestamp | None,
+    *,
+    months: int = 12,
+) -> pd.DataFrame:
+    """Filter hotspot records to a reporting scope and recent month window."""
+
+    if frame.empty:
+        return frame
+    result = frame.copy()
+    if "Factory" in result:
+        if scope == "Supply Chain":
+            result = result[~result["Factory"].isin({"GEA", "BODE", "Other"})]
+        elif scope == "GE Appliances":
+            result = result[~result["Factory"].isin({"GEA", "Other"})]
+        else:
+            result = result[result["Factory"] == scope]
+    if result.empty or "Date" not in result:
+        return result
+    dates = pd.to_datetime(result["Date"], errors="coerce")
+    if not dates.notna().any():
+        return result.iloc[0:0].copy()
+    effective_end = (
+        pd.Timestamp(end_date).to_period("M").end_time.normalize()
+        if end_date is not None
+        else dates.max().to_period("M").end_time.normalize()
+    )
+    effective_start = (
+        effective_end.to_period("M").start_time.normalize()
+        - pd.DateOffset(months=max(months - 1, 0))
+    )
+    return result[(dates >= effective_start) & (dates <= effective_end)].copy()
+
+
+def injury_work_area_summary(
+    frame: pd.DataFrame,
+    *,
+    top_n: int = 10,
+) -> pd.DataFrame:
+    """Rank departments/workstations by recent ergonomic injury count."""
+
+    columns = [
+        "Factory",
+        "Department / Workstation",
+        "Source",
+        "Recent Injuries",
+        "Share of Tagged Injuries",
+        "Most Recent Injury",
+    ]
+    if frame.empty or "Work Area" not in frame:
+        return pd.DataFrame(columns=columns)
+    tagged = frame[frame["Work Area"].fillna("").astype(str).str.strip().ne("")].copy()
+    if tagged.empty:
+        return pd.DataFrame(columns=columns)
+    count_source = pd.to_numeric(
+        tagged.get("Injury Count", pd.Series(1, index=tagged.index)),
+        errors="coerce",
+    ).fillna(0)
+    tagged["Recent Injuries"] = count_source
+    ranked = (
+        tagged.groupby(["Factory", "Work Area", "Work Area Source"], as_index=False)
+        .agg(
+            **{
+                "Recent Injuries": ("Recent Injuries", "sum"),
+                "Most Recent Injury": ("Date", "max"),
+            }
+        )
+        .sort_values(
+            ["Recent Injuries", "Most Recent Injury", "Work Area"],
+            ascending=[False, False, True],
+        )
+        .head(top_n)
+    )
+    total_tagged = float(count_source.sum())
+    ranked["Share of Tagged Injuries"] = ranked["Recent Injuries"].div(
+        total_tagged if total_tagged else float("nan")
+    )
+    ranked = ranked.rename(
+        columns={
+            "Work Area": "Department / Workstation",
+            "Work Area Source": "Source",
+        }
+    )
+    ranked["Recent Injuries"] = ranked["Recent Injuries"].astype(int)
+    return ranked[columns].reset_index(drop=True)
+
+
+def injury_category_summary(
+    frame: pd.DataFrame,
+    category: str,
+    *,
+    top_n: int = 8,
+) -> pd.DataFrame:
+    """Rank a non-PII injury category such as body part or job factor."""
+
+    columns = [category, "Recent Injuries", "Share of Tagged Injuries"]
+    if frame.empty or category not in frame:
+        return pd.DataFrame(columns=columns)
+    tagged = frame[frame[category].fillna("").astype(str).str.strip().ne("")].copy()
+    if tagged.empty:
+        return pd.DataFrame(columns=columns)
+    tagged["Recent Injuries"] = pd.to_numeric(
+        tagged.get("Injury Count", pd.Series(1, index=tagged.index)),
+        errors="coerce",
+    ).fillna(0)
+    total_tagged = float(tagged["Recent Injuries"].sum())
+    ranked = (
+        tagged.groupby(category, as_index=False)["Recent Injuries"]
+        .sum()
+        .sort_values(["Recent Injuries", category], ascending=[False, True])
+        .head(top_n)
+    )
+    ranked["Recent Injuries"] = ranked["Recent Injuries"].astype(int)
+    ranked["Share of Tagged Injuries"] = ranked["Recent Injuries"].div(
+        total_tagged if total_tagged else float("nan")
+    )
+    return ranked[columns].reset_index(drop=True)
+
+
+def workers_comp_driver_summary(
+    frame: pd.DataFrame,
+    category: str = "Claim Cause",
+    *,
+    top_n: int = 8,
+) -> pd.DataFrame:
+    """Rank recent workers' comp claim drivers by claim count and net incurred."""
+
+    columns = [category, "Claims", "Share of Tagged Claims", "Net Total Incurred"]
+    if frame.empty or category not in frame:
+        return pd.DataFrame(columns=columns)
+    tagged = frame[frame[category].fillna("").astype(str).str.strip().ne("")].copy()
+    if tagged.empty:
+        return pd.DataFrame(columns=columns)
+    tagged["Claims"] = pd.to_numeric(
+        tagged.get("Claim Count", pd.Series(1, index=tagged.index)),
+        errors="coerce",
+    ).fillna(0)
+    tagged["Net Total Incurred"] = pd.to_numeric(
+        tagged.get("Amount", pd.Series(0, index=tagged.index)),
+        errors="coerce",
+    ).fillna(0)
+    total_tagged = float(tagged["Claims"].sum())
+    ranked = (
+        tagged.groupby(category, as_index=False)
+        .agg(
+            Claims=("Claims", "sum"),
+            **{"Net Total Incurred": ("Net Total Incurred", "sum")},
+        )
+        .sort_values(["Claims", "Net Total Incurred", category], ascending=[False, False, True])
+        .head(top_n)
+    )
+    ranked["Claims"] = ranked["Claims"].astype(int)
+    ranked["Share of Tagged Claims"] = ranked["Claims"].div(
+        total_tagged if total_tagged else float("nan")
+    )
+    return ranked[columns].reset_index(drop=True)
+
+
 def default_site_risk_reduction_goals(
     frame: pd.DataFrame,
     sites: list[str],
@@ -601,6 +1067,12 @@ def default_combined_pdf_sites(scopes: list[str]) -> list[str]:
     """Select every factory and aggregate scope except Other by default."""
 
     return [scope for scope in scopes if scope != "Other"]
+
+
+GE_INJURY_SCOPE_NOTE = (
+    "GE Appliances injury figures include major factory and Factory Service "
+    "sites only; Other locations are excluded."
+)
 
 
 def apply_program_filter(frame: pd.DataFrame, selected_programs: list[str]) -> pd.DataFrame:
@@ -1007,10 +1479,13 @@ def make_ergo_classification_chart(frame: pd.DataFrame) -> go.Figure:
             go.Bar(x=monthly["Date"], y=monthly[column], name=label, marker_color=color)
         )
     fig.update_layout(
-        title="Monthly Ergo Cases by Classification",
+        title=(
+            "Monthly Ergo Cases by Classification"
+            "<br><sup>Cases occurring in each month — not rolling 12</sup>"
+        ),
         barmode="stack",
         height=360,
-        margin=dict(l=16, r=16, t=44, b=90),
+        margin=dict(l=16, r=16, t=58, b=90),
         xaxis_title="",
         yaxis_title="Cases",
         legend=below_chart_legend(),
@@ -1041,7 +1516,11 @@ def make_production_assessment_chart(frame: pd.DataFrame) -> go.Figure:
             "Green": "#69C466",
         },
     )
-    fig.update_traces(textposition="inside", textinfo="percent")
+    fig.update_traces(
+        textposition="inside",
+        textinfo="percent",
+        textfont_size=18,
+    )
     fig.update_layout(title="Ergo Assessments", height=255, margin=dict(l=0, r=0, t=32, b=0), showlegend=False, paper_bgcolor="white")
     return fig
 
@@ -1056,7 +1535,7 @@ def make_pdf_assessment_chart(frame: pd.DataFrame) -> go.Figure:
         hole=0,
         textinfo="percent",
         textposition="inside",
-        textfont_size=11,
+        textfont_size=15,
     )
     fig.update_layout(
         title=None,
@@ -1090,6 +1569,167 @@ def make_production_projects_chart(actual_points: float, goal_points: float, yea
     )
     fig.update_xaxes(showgrid=False)
     fig.update_yaxes(range=[0, yaxis_top], gridcolor="#E6EAF0", zeroline=False)
+    return fig
+
+
+def workers_comp_yearly_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate unique ergonomic workers-comp claims by loss year and site."""
+
+    if frame.empty:
+        return pd.DataFrame(
+            columns=[
+                "Year",
+                "Factory",
+                "Claims",
+                "Closed Claims",
+                "Open Claims",
+                "Incident Claims",
+                "Unknown Status",
+                "Known Status Claims",
+                "Closed %",
+                "Net Total Incurred",
+            ]
+        )
+    data = frame.dropna(subset=["Date"]).copy()
+    data["Year"] = data["Date"].dt.year.astype(int)
+    claim_source = (
+        data["Claim Count"]
+        if "Claim Count" in data
+        else pd.Series(1, index=data.index)
+    )
+    claim_counts = pd.to_numeric(claim_source, errors="coerce").fillna(0).astype(int)
+    data["Claims"] = claim_counts
+    status = data.get("Claim Status", pd.Series("Unknown", index=data.index))
+    status = status.fillna("Unknown").astype(str)
+    data["Closed Claims"] = claim_counts.where(status.eq("Closed"), 0)
+    data["Open Claims"] = claim_counts.where(status.eq("Open"), 0)
+    data["Incident Claims"] = claim_counts.where(status.eq("Incident"), 0)
+    data["Unknown Status"] = claim_counts.where(
+        ~status.isin(["Closed", "Open", "Incident"]),
+        0,
+    )
+    yearly = (
+        data.groupby(["Year", "Factory"], as_index=False)
+        .agg(
+            Claims=("Claims", "sum"),
+            **{
+                "Closed Claims": ("Closed Claims", "sum"),
+                "Open Claims": ("Open Claims", "sum"),
+                "Incident Claims": ("Incident Claims", "sum"),
+                "Unknown Status": ("Unknown Status", "sum"),
+            },
+            **{"Net Total Incurred": ("Amount", "sum")},
+        )
+        .sort_values(["Year", "Factory"])
+    )
+    yearly["Known Status Claims"] = (
+        yearly["Closed Claims"]
+        + yearly["Open Claims"]
+        + yearly["Incident Claims"]
+    )
+    yearly["Closed %"] = (
+        yearly["Closed Claims"]
+        .div(yearly["Known Status Claims"].where(yearly["Known Status Claims"] > 0))
+        .mul(100)
+    )
+    return yearly
+
+
+def make_workers_comp_yearly_chart(frame: pd.DataFrame) -> go.Figure:
+    yearly = workers_comp_yearly_summary(frame)
+    if yearly.empty:
+        return go.Figure()
+    yearly["Loss Year"] = yearly["Year"].astype(str)
+    yearly["Closed Label"] = yearly["Closed %"].map(
+        lambda value: f"{value:.1f}%" if pd.notna(value) else "N/A"
+    )
+    annual_status = yearly.groupby("Year", as_index=False).agg(
+        **{
+            "Closed Claims": ("Closed Claims", "sum"),
+            "Known Status Claims": ("Known Status Claims", "sum"),
+        }
+    )
+    annual_status["Closed %"] = (
+        annual_status["Closed Claims"]
+        .div(
+            annual_status["Known Status Claims"].where(
+                annual_status["Known Status Claims"] > 0
+            )
+        )
+        .mul(100)
+    )
+    closed_by_year = annual_status.set_index("Year")["Closed %"].to_dict()
+    tick_years = sorted(yearly["Year"].unique())
+    tick_text = [
+        f"{year}<br>"
+        + (
+            f"{closed_by_year[year]:.1f}% closed"
+            if pd.notna(closed_by_year.get(year))
+            else "Closed: N/A"
+        )
+        for year in tick_years
+    ]
+    site_colors = {
+        "AP1": "#315B7D",
+        "AP2": "#4D74BE",
+        "AP3": "#63A4C7",
+        "AP4": "#5E8F39",
+        "AP5": "#69C466",
+        "CPO": "#F4B400",
+        "DPO": "#D98F8F",
+        "MRO": "#8B5CF6",
+        "RPO": "#D64545",
+        "BODE": "#6B1E5B",
+        "Other": "#9CA3AF",
+    }
+    fig = px.bar(
+        yearly,
+        x="Loss Year",
+        y="Net Total Incurred",
+        color="Factory",
+        barmode="group",
+        text="Claims",
+        custom_data=[
+            "Claims",
+            "Closed Claims",
+            "Open Claims",
+            "Incident Claims",
+            "Unknown Status",
+            "Closed Label",
+        ],
+        color_discrete_map=site_colors,
+        category_orders={"Factory": list(site_colors)},
+    )
+    fig.update_traces(
+        texttemplate="%{text}",
+        textposition="outside",
+        cliponaxis=False,
+        hovertemplate=(
+            "Site: %{fullData.name}<br>Loss year: %{x}<br>"
+            "Net incurred: $%{y:,.0f}<br>Claims: %{customdata[0]}<br>"
+            "Closed: %{customdata[1]}<br>Open: %{customdata[2]}<br>"
+            "Incident: %{customdata[3]}<br>Unknown: %{customdata[4]}<br>"
+            "Closed rate: %{customdata[5]}<extra></extra>"
+        ),
+    )
+    fig.update_layout(
+        title="Ergonomic Workers' Compensation Yearly Trends",
+        height=410,
+        margin=dict(l=92, r=16, t=48, b=100),
+        legend=below_chart_legend(),
+        xaxis_title="Date-of-loss year (bar labels show claim count)",
+        yaxis_title="Net total incurred",
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+    )
+    fig.update_xaxes(
+        showgrid=False,
+        type="category",
+        tickmode="array",
+        tickvals=[str(year) for year in tick_years],
+        ticktext=tick_text,
+    )
+    fig.update_yaxes(gridcolor="#E6EAF0", zeroline=False, tickprefix="$", tickformat=",.0f")
     return fig
 
 
@@ -1649,6 +2289,8 @@ def render_pdf_report(
     end_date: pd.Timestamp | None = None,
     site_risk_reduction_goals: dict[str, float] | None = None,
 ) -> bytes:
+    if scope == "Other":
+        raise ValueError("Other locations are excluded from injury PDF reporting.")
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
     styles = getSampleStyleSheet()
@@ -1661,6 +2303,8 @@ def render_pdf_report(
             styles["BodyText"],
         )
     )
+    if scope == "GE Appliances":
+        story.append(Paragraph(GE_INJURY_SCOPE_NOTE, styles["BodyText"]))
     story.append(Spacer(1, 10))
 
     production_history = aggregate_scope(
@@ -1677,8 +2321,8 @@ def render_pdf_report(
     medical_requests = apply_scope_date_filter(
         data.get("medical_requests", pd.DataFrame()), scope, start_date, end_date
     )
-    workers_comp = apply_scope_date_filter(
-        data.get("workers_comp", pd.DataFrame()), scope, start_date, end_date
+    workers_comp = apply_workers_comp_ytd_filter(
+        data.get("workers_comp", pd.DataFrame()), scope, end_date
     )
     summary = summarize_production_dashboard(
         production_summary,
@@ -2088,7 +2732,7 @@ def _snapshot_operational_items(
         (
             f"{summary['latest_year']} Workers Comp",
             f"${summary['current_workers_comp']:,.0f}",
-            "Paid out",
+            "Net incurred",
         ),
     ]
 
@@ -2267,8 +2911,8 @@ def _factory_snapshot_page(
     medical = apply_scope_date_filter(
         data.get("medical_requests", pd.DataFrame()), scope, start_date, end_date
     )
-    workers = apply_scope_date_filter(
-        data.get("workers_comp", pd.DataFrame()), scope, start_date, end_date
+    workers = apply_workers_comp_ytd_filter(
+        data.get("workers_comp", pd.DataFrame()), scope, end_date
     )
     summary = summarize_production_dashboard(
         production_summary,
@@ -2289,7 +2933,12 @@ def _factory_snapshot_page(
         f"{scope} Ergo Metrics",
         "AIE and Ergo Snapshot Report",
         f"<b>Selected period</b><br/>{period_start} - {period_end}<br/>"
-        f"Latest completed: {summary['latest_date'].strftime('%B %Y')}",
+        f"Latest completed: {summary['latest_date'].strftime('%B %Y')}"
+        + (
+            f"<br/><font size='6'>{GE_INJURY_SCOPE_NOTE}</font>"
+            if scope == "GE Appliances"
+            else ""
+        ),
         styles,
     )
     kpi_backgrounds = {
@@ -2360,6 +3009,135 @@ def _factory_snapshot_page(
         lower_row,
         Spacer(1, 4),
         operational_strip,
+    ]
+
+
+def _workers_comp_snapshot_page(
+    data: Dict[str, pd.DataFrame],
+    styles: dict,
+) -> list[object]:
+    workers = data.get("workers_comp", pd.DataFrame()).copy()
+    yearly = workers_comp_yearly_summary(workers)
+    if yearly.empty or int(yearly["Claims"].sum()) == 0:
+        return []
+
+    annual = (
+        yearly.groupby("Year", as_index=False)
+        .agg(
+            Claims=("Claims", "sum"),
+            **{
+                "Closed Claims": ("Closed Claims", "sum"),
+                "Open Claims": ("Open Claims", "sum"),
+                "Incident Claims": ("Incident Claims", "sum"),
+                "Unknown Status": ("Unknown Status", "sum"),
+                "Known Status Claims": ("Known Status Claims", "sum"),
+                "Net Total Incurred": ("Net Total Incurred", "sum"),
+            },
+        )
+        .sort_values("Year")
+    )
+    annual["Closed %"] = (
+        annual["Closed Claims"]
+        .div(annual["Known Status Claims"].where(annual["Known Status Claims"] > 0))
+        .mul(100)
+    )
+    annual["Average per Claim"] = annual["Net Total Incurred"].div(
+        annual["Claims"].where(annual["Claims"] > 0)
+    )
+    by_site = (
+        yearly.groupby("Factory", as_index=False)
+        .agg(
+            Claims=("Claims", "sum"),
+            **{
+                "Closed Claims": ("Closed Claims", "sum"),
+                "Known Status Claims": ("Known Status Claims", "sum"),
+                "Net Total Incurred": ("Net Total Incurred", "sum"),
+            },
+        )
+        .sort_values("Net Total Incurred", ascending=False)
+    )
+    by_site["Closed %"] = (
+        by_site["Closed Claims"]
+        .div(by_site["Known Status Claims"].where(by_site["Known Status Claims"] > 0))
+        .mul(100)
+    )
+    by_site["Average per Claim"] = by_site["Net Total Incurred"].div(
+        by_site["Claims"].where(by_site["Claims"] > 0)
+    )
+    latest = annual.iloc[-1]
+    first_year = int(annual.iloc[0]["Year"])
+    latest_year = int(latest["Year"])
+    header = _snapshot_header(
+        "Ergonomic Workers' Compensation Trends",
+        "All Sites — Based on Date of Loss",
+        f"<b>Loss years</b><br/>{first_year} - {latest_year}<br/>"
+        f"Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}",
+        styles,
+    )
+    kpis = _snapshot_kpis(
+        [
+            ("Total Claims", f"{int(annual['Claims'].sum()):,}", f"{first_year}-{latest_year}"),
+            ("Total Net Incurred", f"${annual['Net Total Incurred'].sum():,.0f}", "All loss years"),
+            (f"{latest_year} Claims", f"{int(latest['Claims']):,}", "Latest loss year"),
+            (f"{latest_year} Net Incurred", f"${latest['Net Total Incurred']:,.0f}", "Latest loss year"),
+        ],
+        [PDF_NEUTRAL, colors.HexColor("#E3EDF7"), PDF_NEUTRAL, colors.HexColor("#E3EDF7")],
+    )
+    chart = _snapshot_chart(
+        make_workers_comp_yearly_chart(workers),
+        730,
+        225,
+        1400,
+        470,
+    )
+    chart_card = _snapshot_card(chart, 744)
+    annual_rows: list[list[object]] = [
+        ["Loss Year", "Claims", "Closed", "Closed %", "Net Incurred"]
+    ]
+    for row in annual.to_dict("records"):
+        annual_rows.append(
+            [
+                str(int(row["Year"])),
+                f"{int(row['Claims']):,}",
+                f"{int(row['Closed Claims']):,}",
+                f"{row['Closed %']:.1f}%" if pd.notna(row["Closed %"]) else "N/A",
+                f"${row['Net Total Incurred']:,.0f}",
+            ]
+        )
+    site_rows: list[list[object]] = [
+        ["Site", "Claims", "Closed", "Closed %", "Net Incurred"]
+    ]
+    for row in by_site.to_dict("records"):
+        site_rows.append(
+            [
+                str(row["Factory"]),
+                f"{int(row['Claims']):,}",
+                f"{int(row['Closed Claims']):,}",
+                f"{row['Closed %']:.1f}%" if pd.notna(row["Closed %"]) else "N/A",
+                f"${row['Net Total Incurred']:,.0f}",
+            ]
+        )
+    tables = _snapshot_card_row(
+        [
+            _snapshot_card(
+                _snapshot_table(annual_rows, [56, 45, 45, 61, 105], font_size=6.2),
+                366,
+            ),
+            _snapshot_card(
+                _snapshot_table(site_rows, [56, 45, 45, 61, 105], font_size=6.2),
+                366,
+            ),
+        ],
+        [366, 366],
+    )
+    return [
+        header,
+        Spacer(1, 6),
+        kpis,
+        Spacer(1, 5),
+        chart_card,
+        Spacer(1, 5),
+        tables,
     ]
 
 
@@ -2586,6 +3364,7 @@ def render_combined_pdf_report(
     end_date: pd.Timestamp | None = None,
     site_risk_reduction_goals: dict[str, float] | None = None,
 ) -> bytes:
+    scopes = [scope for scope in scopes if scope != "Other"]
     if not scopes and not programs:
         raise ValueError("Select at least one factory/scope or NPI program.")
     ensure_plotly_image_export_ready()
@@ -2628,6 +3407,9 @@ def render_combined_pdf_report(
         )
         if page:
             pages.append(page)
+    workers_comp_page = _workers_comp_snapshot_page(data, styles)
+    if workers_comp_page:
+        pages.append(workers_comp_page)
     for program in programs:
         page = _npi_snapshot_page(data, program, start_date, end_date, styles)
         if page:
@@ -2695,6 +3477,7 @@ def main() -> None:
         return
 
     prod_df = data.get("production_injuries", pd.DataFrame()).copy()
+    injury_hotspots_df = data.get("injury_hotspots", pd.DataFrame()).copy()
     assessment_df = data.get("ergo_assessments", pd.DataFrame()).copy()
     risk_project_df = data.get("risk_projects", pd.DataFrame()).copy()
     risk_reduction_goals_df = data.get("risk_reduction_goals", pd.DataFrame()).copy()
@@ -2827,7 +3610,7 @@ def main() -> None:
             scopes,
             default=default_pdf_sites,
             help=(
-                "All sites and aggregate scopes except Other are selected by default. Each "
+                "All available sites and aggregate scopes are selected by default. Each "
                 "selected factory or aggregate scope becomes one landscape page."
             ),
             key="combined_pdf_scopes_all_except_other",
@@ -2839,8 +3622,14 @@ def main() -> None:
             help="Each selected NPI program becomes one landscape page in the same PDF.",
             key="combined_pdf_programs",
         )
+        workers_comp_pdf_summary = workers_comp_yearly_summary(workers_comp_df)
+        workers_comp_page_count = int(
+            not workers_comp_pdf_summary.empty
+            and workers_comp_pdf_summary["Claims"].sum() > 0
+        )
         st.caption(
             f"Planned report: {len(pdf_scopes)} factory page(s) + "
+            f"{workers_comp_page_count} workers comp page(s) + "
             f"{len(pdf_programs)} NPI page(s)."
         )
 
@@ -2855,7 +3644,21 @@ def main() -> None:
             end_date,
         )
         medical_filtered = apply_scope_date_filter(medical_df, selected_scope, start_date, end_date)
-        workers_comp_filtered = apply_scope_date_filter(workers_comp_df, selected_scope, start_date, end_date)
+        workers_comp_filtered = apply_workers_comp_ytd_filter(
+            workers_comp_df,
+            selected_scope,
+            end_date,
+        )
+        recent_injury_focus = apply_recent_focus_filter(
+            injury_hotspots_df,
+            selected_scope,
+            end_date,
+        )
+        recent_workers_comp_focus = apply_recent_focus_filter(
+            workers_comp_df,
+            selected_scope,
+            end_date,
+        )
 
         st.subheader(f"Production Dashboard — {selected_scope}")
         if prod_filtered.empty:
@@ -2937,12 +3740,19 @@ def main() -> None:
                             dart_goal=summary["dart_goal"],
                         ),
                         width="stretch",
+                        key="production_injury_trend_chart",
                     )
+                    if selected_scope == "GE Appliances":
+                        st.caption(GE_INJURY_SCOPE_NOTE)
             with top_right:
                 with st.container(border=True):
                     assess_top = st.columns([2.0, 1.0])
                     with assess_top[0]:
-                        st.plotly_chart(make_production_assessment_chart(assessment_filtered), width="stretch")
+                        st.plotly_chart(
+                            make_production_assessment_chart(assessment_filtered),
+                            width="stretch",
+                            key="production_assessment_chart",
+                        )
                     with assess_top[1]:
                         st.markdown(f'<div class="prod-metric-box prod-metric-green"><div class="prod-metric-value">{summary["green_count"]}</div><div class="prod-kicker">Green</div></div>', unsafe_allow_html=True)
                         st.markdown(f'<div class="prod-metric-box prod-metric-yellow"><div class="prod-metric-value">{summary["yellow_count"]}</div><div class="prod-kicker">Yellow</div></div>', unsafe_allow_html=True)
@@ -2956,6 +3766,7 @@ def main() -> None:
                     st.plotly_chart(
                         make_ergo_classification_chart(prod_filtered),
                         width="stretch",
+                        key="production_ergo_classification_chart",
                     )
             with risk_reduction_column:
                 with st.container(border=True):
@@ -2967,6 +3778,7 @@ def main() -> None:
                             latest_year,
                         ),
                         width="stretch",
+                        key="production_risk_reduction_chart",
                     )
                     st.markdown(
                         f"""
@@ -2984,6 +3796,148 @@ def main() -> None:
                         unsafe_allow_html=True,
                     )
 
+            work_area_focus = injury_work_area_summary(recent_injury_focus)
+            body_part_focus = injury_category_summary(
+                recent_injury_focus,
+                "Body Part",
+                top_n=6,
+            )
+            job_factor_focus = injury_category_summary(
+                recent_injury_focus,
+                "Job Factor",
+                top_n=5,
+            )
+            claim_cause_focus = workers_comp_driver_summary(
+                recent_workers_comp_focus,
+                "Claim Cause",
+                top_n=6,
+            )
+            claim_body_focus = workers_comp_driver_summary(
+                recent_workers_comp_focus,
+                "Body Part",
+                top_n=5,
+            )
+            with st.container(border=True):
+                st.markdown(f"**Where to focus — {selected_scope}**")
+                st.caption(
+                    "Recent = trailing 12 months through the selected end month. "
+                    "Rankings follow the selected plant or business scope. Work areas use "
+                    "Workstation first, then Sub-Department, Employee Dept, and SubSite "
+                    "when available."
+                )
+                focus_area_column, injury_pattern_column, claim_driver_column = st.columns(3)
+                with focus_area_column:
+                    st.markdown("**Departments and workstations**")
+                    if not work_area_focus.empty:
+                        work_area_display = work_area_focus.copy()
+                        if selected_scope not in {"GE Appliances", "Supply Chain"}:
+                            work_area_display = work_area_display.drop(columns=["Factory"])
+                        st.dataframe(
+                            work_area_display,
+                            width="stretch",
+                            hide_index=True,
+                            column_config={
+                                "Department / Workstation": st.column_config.TextColumn(
+                                    "Department / workstation"
+                                ),
+                                "Recent Injuries": st.column_config.NumberColumn(
+                                    "Injuries",
+                                    format="%d",
+                                ),
+                                "Share of Tagged Injuries": st.column_config.NumberColumn(
+                                    "Share",
+                                    format="percent",
+                                ),
+                                "Most Recent Injury": st.column_config.DateColumn(
+                                    "Latest",
+                                    format="MMM YYYY",
+                                ),
+                            },
+                        )
+                        tagged_count = int(
+                            recent_injury_focus["Work Area"]
+                            .fillna("")
+                            .astype(str)
+                            .str.strip()
+                            .ne("")
+                            .sum()
+                        )
+                        st.caption(
+                            f"{tagged_count:,} of {len(recent_injury_focus):,} recent injuries "
+                            "have a department/work-area value."
+                        )
+                    else:
+                        st.caption("No department or workstation data is available for this scope.")
+                with injury_pattern_column:
+                    st.markdown("**Injury patterns**")
+                    if not body_part_focus.empty:
+                        st.caption("Body parts")
+                        st.dataframe(
+                            body_part_focus,
+                            width="stretch",
+                            hide_index=True,
+                            column_config={
+                                "Recent Injuries": st.column_config.NumberColumn(
+                                    "Injuries",
+                                    format="%d",
+                                ),
+                                "Share of Tagged Injuries": st.column_config.NumberColumn(
+                                    "Share",
+                                    format="percent",
+                                ),
+                            },
+                        )
+                    if not job_factor_focus.empty:
+                        st.caption("Job factors")
+                        st.dataframe(
+                            job_factor_focus,
+                            width="stretch",
+                            hide_index=True,
+                            column_config={
+                                "Recent Injuries": st.column_config.NumberColumn(
+                                    "Injuries",
+                                    format="%d",
+                                ),
+                                "Share of Tagged Injuries": st.column_config.NumberColumn(
+                                    "Share",
+                                    format="percent",
+                                ),
+                            },
+                        )
+                    if body_part_focus.empty and job_factor_focus.empty:
+                        st.caption("No injury-pattern data is available for this scope.")
+                with claim_driver_column:
+                    st.markdown("**Workers’ comp claim drivers**")
+                    claim_column_config = {
+                        "Claims": st.column_config.NumberColumn("Claims", format="%d"),
+                        "Share of Tagged Claims": st.column_config.NumberColumn(
+                            "Share",
+                            format="percent",
+                        ),
+                        "Net Total Incurred": st.column_config.NumberColumn(
+                            "Net incurred",
+                            format="$%.0f",
+                        ),
+                    }
+                    if not claim_cause_focus.empty:
+                        st.caption("Causes")
+                        st.dataframe(
+                            claim_cause_focus,
+                            width="stretch",
+                            hide_index=True,
+                            column_config=claim_column_config,
+                        )
+                    if not claim_body_focus.empty:
+                        st.caption("Body parts")
+                        st.dataframe(
+                            claim_body_focus,
+                            width="stretch",
+                            hide_index=True,
+                            column_config=claim_column_config,
+                        )
+                    if claim_cause_focus.empty and claim_body_focus.empty:
+                        st.caption("No workers’ comp driver data is available for this scope.")
+
             medical_column, injury_column, workers_column = st.columns([1.0, 1.35, 1.0])
             with medical_column:
                 with st.container(border=True):
@@ -2995,19 +3949,90 @@ def main() -> None:
                     st.dataframe(injury_table, width="stretch", hide_index=True)
             with workers_column:
                 with st.container(border=True):
-                    st.markdown("**Workers Compensation Ergo Claims Paid Out (YTD)**")
+                    st.markdown("**Workers Compensation Ergo Claims Net Incurred (YTD)**")
                     if not workers_table.empty:
                         st.dataframe(workers_table, width="stretch", hide_index=True)
                         if summary["prior_workers_comp"]:
                             st.caption(f"Change vs prior year: {summary['workers_change']:+.1f}%")
                     else:
                         st.caption("No workers compensation data is available for the selected filters.")
+            workers_comp_scope = apply_workers_comp_scope_filter(
+                workers_comp_df,
+                selected_scope,
+            )
+            workers_comp_trends = workers_comp_yearly_summary(workers_comp_scope)
+            if not workers_comp_trends.empty and workers_comp_trends["Claims"].sum() > 0:
+                with st.container(border=True):
+                    st.markdown(
+                        "**Ergonomic Workers' Compensation Yearly Trends "
+                        f"— {selected_scope}**"
+                    )
+                    st.caption(
+                        "Loss year is based on Date_of_Loss. Bar labels show unique claim counts; "
+                        "the x-axis shows the percent closed among claims with a known status. "
+                        "Incident is treated as known but not closed; blank/N/A statuses are excluded. "
+                        "Cost is Net_Total_Incurred. "
+                        "Claimant names and claim details are not retained or displayed."
+                    )
+                    st.plotly_chart(
+                        make_workers_comp_yearly_chart(workers_comp_scope),
+                        width="stretch",
+                        key="production_workers_comp_chart",
+                    )
+                    annual_workers = (
+                        workers_comp_trends.groupby("Year", as_index=False)
+                        .agg(
+                            Claims=("Claims", "sum"),
+                            **{
+                                "Closed Claims": ("Closed Claims", "sum"),
+                                "Open Claims": ("Open Claims", "sum"),
+                                "Incident Claims": ("Incident Claims", "sum"),
+                                "Unknown Status": ("Unknown Status", "sum"),
+                                "Known Status Claims": ("Known Status Claims", "sum"),
+                                "Net Total Incurred": (
+                                    "Net Total Incurred",
+                                    "sum",
+                                )
+                            },
+                        )
+                        .sort_values("Year", ascending=False)
+                    )
+                    annual_workers["Closed %"] = (
+                        annual_workers["Closed Claims"]
+                        .div(
+                            annual_workers["Known Status Claims"].where(
+                                annual_workers["Known Status Claims"] > 0
+                            )
+                        )
+                        .mul(100)
+                        .map(lambda value: f"{value:.1f}%" if pd.notna(value) else "N/A")
+                    )
+                    annual_workers = annual_workers[
+                        [
+                            "Year",
+                            "Claims",
+                            "Closed Claims",
+                            "Open Claims",
+                            "Incident Claims",
+                            "Unknown Status",
+                            "Closed %",
+                            "Net Total Incurred",
+                        ]
+                    ]
+                    annual_workers["Net Total Incurred"] = annual_workers[
+                        "Net Total Incurred"
+                    ].map(lambda value: f"${value:,.0f}")
+                    st.dataframe(
+                        annual_workers,
+                        width="stretch",
+                        hide_index=True,
+                    )
             st.caption(
                 "Data note: the EHS source provides a field named EHS_DAFW_Cases but "
                 "labels its supplied rate as EHS DART. Until an all-EHS restricted-case "
                 "count is available, the dashboard carries that source field as the EHS "
-                "DART input. Other-location ergonomic cases are included in GE Appliances "
-                "and Supply Chain counts; no separate hours are available for the Other site."
+                "DART input. Other-location ergonomic cases are excluded from GE Appliances "
+                "and Supply Chain rates because no matching hours are available for that site."
             )
     else:
         npi_metrics_filtered = apply_factory_date_filter(
@@ -3127,6 +4152,7 @@ def main() -> None:
                                 future_color=REDUCTION_CHART_COLORS[part_reduction_status],
                             ),
                             width="stretch",
+                            key="npi_part_count_chart",
                         )
                     else:
                         st.caption("No AIE part-count data is available for this program.")
@@ -3145,6 +4171,7 @@ def main() -> None:
                                 future_color=REDUCTION_CHART_COLORS[headcount_reduction_status],
                             ),
                             width="stretch",
+                            key="npi_headcount_chart",
                         )
                     else:
                         st.caption("No AIE headcount data is available for this program.")
@@ -3163,7 +4190,11 @@ def main() -> None:
             with lower_right:
                 with st.container(border=True):
                     if has_ergo_data:
-                        st.plotly_chart(make_npi_detail_snapshot_chart(npi_reds_filtered), width="stretch")
+                        st.plotly_chart(
+                            make_npi_detail_snapshot_chart(npi_reds_filtered),
+                            width="stretch",
+                            key="npi_ergo_reds_chart",
+                        )
                     else:
                         st.caption("No ergo assessment data is available for this program.")
                     reds_summary = (

@@ -6,32 +6,50 @@ import pandas as pd
 
 from app import (
     apply_factory_date_filter,
+    apply_recent_focus_filter,
+    apply_workers_comp_scope_filter,
+    apply_workers_comp_ytd_filter,
     apply_scope_ytd_filter,
     available_npi_programs,
     build_assessment_df,
+    build_injury_hotspots_df,
     build_npi_metrics_df,
     build_risk_reduction_goals_df,
+    build_workers_comp_df,
     default_combined_pdf_sites,
     default_site_risk_reduction_goals,
     filter_injury_history,
     filter_through_end_month,
     has_npi_values,
     injury_trend_status,
+    injury_category_summary,
+    injury_work_area_summary,
     latest_npi_snapshots,
     make_ergo_classification_chart,
+    make_pdf_assessment_chart,
+    make_production_assessment_chart,
     make_npi_detail_snapshot_chart,
     npi_reporting_month,
+    normalize_workers_comp_site,
     normalize_date_selection,
     open_ergo_reds_status,
     previous_calendar_month,
     reduction_status,
     risk_reduction_goal_for_scope,
+    workers_comp_yearly_summary,
+    workers_comp_driver_summary,
     _snapshot_operational_items,
     _snapshot_case_table_rows,
     _snapshot_factory_kpi_items,
     _snapshot_factory_kpi_statuses,
 )
-from injury_metrics import aggregate_scope, build_monthly_detail, fiscal_year_start
+from injury_metrics import (
+    aggregate_scope,
+    available_scopes,
+    build_ergo_monthly,
+    build_monthly_detail,
+    fiscal_year_start,
+)
 from sanitize_workbook import PII_HEADERS, clean_header
 
 
@@ -71,8 +89,42 @@ class InjuryMetricTests(unittest.TestCase):
         self.assertEqual(fiscal_year_start(2023), pd.Timestamp("2023-01-01"))
 
     def test_only_completed_months_are_published(self) -> None:
-        self.assertEqual(self.latest_month, pd.Timestamp("2026-06-01"))
-        self.assertEqual(self.detail["Date"].max(), pd.Timestamp("2026-06-01"))
+        self.assertEqual(self.latest_month, pd.Timestamp("2026-07-01"))
+        self.assertEqual(self.detail["Date"].max(), pd.Timestamp("2026-07-01"))
+
+    def test_other_is_not_an_available_injury_scope(self) -> None:
+        scopes = available_scopes(self.detail)
+        self.assertNotIn("Other", scopes)
+        self.assertIn("GE Appliances", scopes)
+        self.assertIn("BODE", scopes)
+
+    def test_ergo_case_ids_are_deduplicated_within_site_not_across_sites(self) -> None:
+        source = pd.DataFrame(
+            {
+                "Site": [
+                    "Louisville, AP1, KY",
+                    "Louisville, AP5, KY",
+                    "Louisville, AP1, KY",
+                    "Louisville, AP1, KY",
+                ],
+                "System Case ID": [100, 100, 101, 101],
+                "Case Date": pd.to_datetime(
+                    ["2026-01-05", "2026-02-05", "2026-03-05", "2026-03-05"]
+                ),
+                "U.S. OSHA Recordable?": ["Yes", "No", "No", "No"],
+                "Inj. DAFW?": [0, 0, 0, 0],
+                "Inj. RWA?": [0, 0, 0, 0],
+                "Inj. Other Recordable Case?": [0, 0, 0, 0],
+                "Ill. DAFW?": [0, 0, 0, 0],
+                "Ill. RWA?": [0, 0, 0, 0],
+                "Ill. Other Recordable Case?": [0, 0, 0, 0],
+            }
+        )
+
+        monthly = build_ergo_monthly(source)
+        totals = monthly.groupby("Factory")["Ergo All Cases"].sum().to_dict()
+
+        self.assertEqual(totals, {"AP1": 2, "AP5": 1})
 
     def test_previous_month_default_and_trailing_injury_history(self) -> None:
         default_start, default_end = previous_calendar_month("2026-07-30")
@@ -203,6 +255,29 @@ class InjuryMetricTests(unittest.TestCase):
         self.assertEqual(counts["Red"], 3)
         self.assertEqual(sum(counts.values()), 14)
 
+    def test_missing_assessment_colors_carry_forward_last_site_value(self) -> None:
+        source = pd.DataFrame(
+            {
+                "Factory": ["AP1", "AP3", "AP1", "AP3", "AP4"],
+                "Year": [2026] * 5,
+                "Month": [7, 6, 6, 7, 7],
+                "Critical_Red": [0, 1, 0, 1, None],
+                "Red": [12, 5, 14, 3, 1],
+                "Yellow": [119, 110, 118, 111, 20],
+                "Green": [None, 326, 268, None, None],
+            }
+        )
+
+        assessments = build_assessment_df(source)
+        july_green = assessments[
+            assessments["Date"].eq(pd.Timestamp("2026-07-01"))
+            & assessments["Risk Level"].eq("Green")
+        ].set_index("Factory")["Count"]
+
+        self.assertEqual(int(july_green["AP1"]), 268)
+        self.assertEqual(int(july_green["AP3"]), 326)
+        self.assertEqual(int(july_green["AP4"]), 0)
+
     def test_site_goals_and_risk_reduction_are_year_to_date(self) -> None:
         projects = pd.DataFrame(
             {
@@ -253,6 +328,242 @@ class InjuryMetricTests(unittest.TestCase):
             170.0,
         )
 
+    def test_detailed_workers_comp_claims_map_sites_and_remove_claim_details(self) -> None:
+        source = pd.DataFrame(
+            {
+                "Structure_Name_at_3_Level_Above_Claim_Level": [
+                    "Appliance Park",
+                    "Appliance Park",
+                    "Roper",
+                    "Factory Service",
+                    "ASI",
+                ],
+                "Unit_Name": [
+                    "Appliance Park Hourly AP1",
+                    "Appliance Park Hourly Plastics COE",
+                    "Lafayette Roper Hourly",
+                    "Tech 109-23 Boston",
+                    "ASI Memphis Hourly",
+                ],
+                "File_Number": ["A", "B", "C", "D", "E"],
+                "Date_of_Loss": pd.to_datetime(
+                    ["2025-01-01", "2025-02-01", "2026-01-01", "2026-02-01", "2026-03-01"]
+                ),
+                "Net_Total_Incurred": [100, 200, 300, 400, 500],
+                "Claim_status": ["C", "O", "Incident", None, "CLOSED"],
+            }
+        )
+        claims = build_workers_comp_df(source)
+        self.assertEqual(
+            claims["Factory"].tolist(),
+            ["AP1", "AP4", "RPO", "BODE", "Other"],
+        )
+        self.assertEqual(
+            claims.columns.tolist(),
+            [
+                "Factory",
+                "Date",
+                "Amount",
+                "Claim Count",
+                "Claim Status",
+                "Claim Nature",
+                "Claim Cause",
+                "Body Part",
+            ],
+        )
+        self.assertEqual(
+            claims["Claim Status"].tolist(),
+            ["Closed", "Open", "Incident", "Unknown", "Closed"],
+        )
+        yearly = workers_comp_yearly_summary(claims)
+        self.assertEqual(int(yearly["Claims"].sum()), 5)
+        self.assertEqual(int(yearly["Closed Claims"].sum()), 2)
+        self.assertEqual(int(yearly["Open Claims"].sum()), 1)
+        self.assertEqual(int(yearly["Incident Claims"].sum()), 1)
+        self.assertEqual(int(yearly["Unknown Status"].sum()), 1)
+        self.assertEqual(int(yearly["Known Status Claims"].sum()), 4)
+        self.assertEqual(float(yearly["Net Total Incurred"].sum()), 1500.0)
+
+    def test_injury_hotspots_prioritize_workstation_department_then_subsite(self) -> None:
+        source = pd.DataFrame(
+            {
+                "Site": [
+                    "Louisville, AP1, KY",
+                    "Louisville, AP1, KY",
+                    "Factory Service",
+                    "Decatur, AL",
+                    "Decatur, AL",
+                ],
+                "Case Date": pd.to_datetime(
+                    [
+                        "2026-05-01",
+                        "2026-06-01",
+                        "2026-06-15",
+                        "2026-06-20",
+                        "2026-07-01",
+                    ]
+                ),
+                "Workstation": ["Station 12", None, None, None, None],
+                "Sub-Department": ["Assembly", "Fabrication", None, None, None],
+                "Employee Dept": ["Line 7", "Line 1", "Service", None, None],
+                "SubSite": [
+                    "Building 1",
+                    "Building 2",
+                    "Service Van",
+                    "Fabrication Bay",
+                    "[Not Defined]",
+                ],
+                "Body Part": ["Shoulder", "Back", "Wrist", "Hand", "Elbow"],
+                "Job Factor": [
+                    "Engineering",
+                    "Planning",
+                    "Procedure",
+                    "Inspection",
+                    "Communication",
+                ],
+            }
+        )
+
+        hotspots = build_injury_hotspots_df(source)
+        self.assertEqual(
+            hotspots["Factory"].tolist(),
+            ["AP1", "AP1", "BODE", "DPO", "DPO"],
+        )
+        self.assertEqual(
+            hotspots["Work Area"].tolist(),
+            ["Station 12", "Fabrication", "Service", "Fabrication Bay", ""],
+        )
+        self.assertEqual(
+            hotspots["Work Area Source"].tolist(),
+            ["Workstation", "Sub-Department", "Department", "SubSite", ""],
+        )
+
+    def test_recent_focus_rankings_follow_scope_and_trailing_twelve_months(self) -> None:
+        injuries = pd.DataFrame(
+            {
+                "Factory": ["AP1", "AP1", "AP3", "BODE", "Other"],
+                "Date": pd.to_datetime(
+                    ["2025-07-01", "2025-08-01", "2026-07-01", "2026-06-01", "2026-05-01"]
+                ),
+                "Work Area": ["Old", "Assembly", "Assembly", "Service", "Office"],
+                "Work Area Source": ["Department"] * 5,
+                "Body Part": ["Back", "Back", "Shoulder", "Wrist", "Hand"],
+                "Job Factor": ["Planning", "Planning", "Engineering", "Procedure", "Other"],
+                "Injury Count": [1, 1, 1, 1, 1],
+            }
+        )
+
+        supply_chain = apply_recent_focus_filter(
+            injuries,
+            "Supply Chain",
+            pd.Timestamp("2026-07-15"),
+        )
+        self.assertEqual(supply_chain["Factory"].tolist(), ["AP1", "AP3"])
+        ranked = injury_work_area_summary(supply_chain)
+        self.assertEqual(ranked.iloc[0]["Department / Workstation"], "Assembly")
+        self.assertEqual(int(ranked["Recent Injuries"].sum()), 2)
+        body_parts = injury_category_summary(supply_chain, "Body Part")
+        self.assertEqual(int(body_parts["Recent Injuries"].sum()), 2)
+
+        gea = apply_recent_focus_filter(
+            injuries,
+            "GE Appliances",
+            pd.Timestamp("2026-07-15"),
+        )
+        self.assertEqual(gea["Factory"].tolist(), ["AP1", "AP3", "BODE"])
+
+    def test_workers_comp_driver_summary_ranks_claims_and_cost(self) -> None:
+        claims = pd.DataFrame(
+            {
+                "Claim Cause": ["Repetitive Motion", "Repetitive Motion", "Lifting"],
+                "Claim Count": [1, 1, 1],
+                "Amount": [100, 300, 250],
+            }
+        )
+        summary = workers_comp_driver_summary(claims)
+
+        self.assertEqual(summary.iloc[0]["Claim Cause"], "Repetitive Motion")
+        self.assertEqual(int(summary.iloc[0]["Claims"]), 2)
+        self.assertEqual(float(summary.iloc[0]["Net Total Incurred"]), 400.0)
+
+    def test_workers_comp_factory_service_aliases_map_to_bode(self) -> None:
+        self.assertEqual(
+            normalize_workers_comp_site("Factory Service", "Tech 109-23 Boston"),
+            "BODE",
+        )
+        self.assertEqual(
+            normalize_workers_comp_site(
+                "GE Appliances Factory Service Operations",
+                "Tech 109-23 Boston",
+            ),
+            "BODE",
+        )
+        self.assertEqual(
+            normalize_workers_comp_site("Bodewell", "Service Operations"),
+            "BODE",
+        )
+
+    def test_assessment_pie_percentages_use_readable_font_sizes(self) -> None:
+        assessments = pd.DataFrame(
+            {
+                "Factory": ["AP1", "AP1", "AP1"],
+                "Date": pd.to_datetime(["2026-07-01"] * 3),
+                "Risk Level": ["Green", "Yellow", "Red"],
+                "Count": [50, 30, 20],
+            }
+        )
+        dashboard_chart = make_production_assessment_chart(assessments)
+        pdf_chart = make_pdf_assessment_chart(assessments)
+
+        self.assertEqual(dashboard_chart.data[0].textfont.size, 18)
+        self.assertEqual(pdf_chart.data[0].textfont.size, 15)
+
+    def test_ergo_classification_chart_identifies_monthly_counts(self) -> None:
+        monthly = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-06-01", "2026-07-01"]),
+                "Ergo First Aid": [2, 3],
+                "Ergo DAFW": [1, 0],
+                "Ergo Restricted": [0, 1],
+                "Ergo Other Recordable": [1, 1],
+            }
+        )
+        chart = make_ergo_classification_chart(monthly)
+
+        self.assertIn("Cases occurring in each month", chart.layout.title.text)
+        self.assertIn("not rolling 12", chart.layout.title.text)
+
+    def test_workers_comp_scope_filter_combines_selected_reporting_scope(self) -> None:
+        claims = pd.DataFrame(
+            {
+                "Factory": ["AP1", "AP3", "BODE", "Other"],
+                "Date": pd.to_datetime(
+                    ["2026-01-01", "2026-02-01", "2026-03-01", "2026-04-01"]
+                ),
+                "Amount": [100, 200, 300, 400],
+                "Claim Count": [1, 1, 1, 1],
+            }
+        )
+
+        ap1 = apply_workers_comp_scope_filter(claims, "AP1")
+        self.assertEqual(ap1["Factory"].tolist(), ["AP1"])
+        self.assertEqual(float(ap1["Amount"].sum()), 100.0)
+
+        gea = apply_workers_comp_scope_filter(claims, "GE Appliances")
+        self.assertEqual(gea["Factory"].unique().tolist(), ["GE Appliances"])
+        self.assertEqual(float(gea["Amount"].sum()), 1000.0)
+
+        supply_chain = apply_workers_comp_scope_filter(claims, "Supply Chain")
+        self.assertEqual(supply_chain["Factory"].unique().tolist(), ["Supply Chain"])
+        self.assertEqual(float(supply_chain["Amount"].sum()), 300.0)
+
+        ytd = apply_workers_comp_ytd_filter(
+            claims,
+            "GE Appliances",
+            pd.Timestamp("2026-02-15"),
+        )
+        self.assertEqual(float(ytd["Amount"].sum()), 300.0)
+
     def test_npi_ergo_red_status_colors_follow_status_names(self) -> None:
         reds = pd.DataFrame(
             {
@@ -288,18 +599,38 @@ class InjuryMetricTests(unittest.TestCase):
     def test_ge_appliances_latest_rolling_metrics(self) -> None:
         metrics = aggregate_scope(self.detail, "GE Appliances")
         latest = metrics.iloc[-1]
-        self.assertEqual(latest["Date"], pd.Timestamp("2026-06-01"))
-        self.assertAlmostEqual(latest["Hours R12"], 22_318_366)
-        self.assertAlmostEqual(latest["EHS Recordables R12"], 329)
-        self.assertAlmostEqual(latest["Ergo All Cases R12"], 702)
-        self.assertAlmostEqual(latest["Ergo Recordable R12"], 133)
-        self.assertAlmostEqual(latest["Ergo DART R12"], 98)
+        self.assertEqual(latest["Date"], pd.Timestamp("2026-07-01"))
+        self.assertAlmostEqual(latest["Hours R12"], 21_942_768)
+        self.assertAlmostEqual(latest["EHS Recordables R12"], 308)
+        self.assertAlmostEqual(latest["Ergo All Cases R12"], 934)
+        self.assertAlmostEqual(latest["Ergo Recordable R12"], 136)
+        self.assertAlmostEqual(latest["Ergo DART R12"], 100)
         self.assertAlmostEqual(
-            latest["Ergo Share of EHS Recordables"], 133 / 329 * 100
+            latest["Ergo Share of EHS Recordables"], 136 / 308 * 100
         )
         self.assertAlmostEqual(
-            latest["Ergo All Rate R12"], 702 * 200_000 / 22_318_366
+            latest["Ergo All Rate R12"], 934 * 200_000 / 21_942_768
         )
+
+    def test_ap1_and_ap5_latest_rolling_metrics_keep_cross_site_ids(self) -> None:
+        expected = {
+            "AP1": {
+                "Hours R12": 2_678_595,
+                "Ergo All Cases R12": 128,
+                "Ergo Recordable R12": 13,
+                "Ergo DART R12": 8,
+            },
+            "AP5": {
+                "Hours R12": 3_245_913,
+                "Ergo All Cases R12": 136,
+                "Ergo Recordable R12": 14,
+                "Ergo DART R12": 5,
+            },
+        }
+        for scope, metrics in expected.items():
+            latest = aggregate_scope(self.detail, scope).iloc[-1]
+            for column, value in metrics.items():
+                self.assertAlmostEqual(latest[column], value)
 
     def test_supply_chain_excludes_bodewell(self) -> None:
         gea = aggregate_scope(self.detail, "GE Appliances").iloc[-1]
